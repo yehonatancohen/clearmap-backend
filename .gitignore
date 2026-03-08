@@ -1,0 +1,30 @@
+# ─── Python ──────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ─── Secrets & sessions ─────────────────────
+*.env
+!config.env_example
+*.session
+*.session-journal
+*.session.enc
+*.key
+
+# ─── Data ────────────────────────────────────
+data/
+downloads/
+
+# ─── IDE ─────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── OS ──────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+*/serviceAccountKey.json
+screenshots/
