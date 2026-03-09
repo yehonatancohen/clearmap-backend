@@ -567,20 +567,16 @@ def fetch_oref() -> list[tuple[str, str]]:
         resp.raise_for_status()
     except requests.exceptions.HTTPError as e:
         if resp.status_code == 403:
-            log.error("HTTP 403 Forbidden from Oref. If you are deployed outside Israel, Oref's geo-blocking firewall is dropping your requests. Set OREF_PROXY_URL to an Israeli proxy.")
+            log.error("HTTP 403 Forbidden from Oref (or bridge proxy). Set OREF_PROXY_URL to an Israeli proxy if hitting Oref directly.")
         raise e
 
-    text = resp.text.strip()
-    if text.startswith("\ufeff"):
-        text = text[1:]
-    text = text.strip()
-    if not text or text in ("null", "[]", "{}"):
+    try:
+        data = resp.json()
+    except json.JSONDecodeError:
+        log.warning("Oref (or proxy) returned non-JSON")
         return []
 
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        log.warning("Oref returned non-JSON (first 200 chars): %s", text[:200])
+    if not data:
         return []
 
     # Normalise: API can return a single object or an array of objects
