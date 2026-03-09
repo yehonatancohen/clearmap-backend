@@ -475,7 +475,22 @@ def load_polygons() -> dict:
 
 def init_firebase():
     """Initialize Firebase Admin SDK."""
-    cred = credentials.Certificate(str(SERVICE_ACCOUNT_FILE))
+    import base64
+    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON") or _cfg_env.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        try:
+            if sa_json.strip().startswith("{"):
+                cert_dict = json.loads(sa_json)
+            else:
+                cert_dict = json.loads(base64.b64decode(sa_json).decode("utf-8"))
+            cred = credentials.Certificate(cert_dict)
+            log.info("Loaded service account from FIREBASE_SERVICE_ACCOUNT_JSON env var.")
+        except Exception as e:
+            log.error("Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: %s", e)
+            cred = credentials.Certificate(str(SERVICE_ACCOUNT_FILE))
+    else:
+        cred = credentials.Certificate(str(SERVICE_ACCOUNT_FILE))
+        
     firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
     log.info("Firebase initialized → %s", FIREBASE_DB_URL)
 

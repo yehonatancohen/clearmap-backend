@@ -608,7 +608,22 @@ def main():
         polygons = json.load(f)
 
     # Init Firebase
-    cred = credentials.Certificate(str(SERVICE_ACCOUNT))
+    import base64
+    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        try:
+            if sa_json.strip().startswith("{"):
+                cert_dict = json.loads(sa_json)
+            else:
+                cert_dict = json.loads(base64.b64decode(sa_json).decode("utf-8"))
+            cred = credentials.Certificate(cert_dict)
+            print("Loaded service account from FIREBASE_SERVICE_ACCOUNT_JSON env var.")
+        except Exception as e:
+            print(f"Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: {e}")
+            cred = credentials.Certificate(str(SERVICE_ACCOUNT))
+    else:
+        cred = credentials.Certificate(str(SERVICE_ACCOUNT))
+
     firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
 
     print(f"Loaded {len(polygons)} cities.")
