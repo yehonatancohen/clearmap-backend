@@ -31,7 +31,7 @@ from firebase_admin import credentials, db
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-OREF_URL = "https://www.oref.org.il/WarningMessages/alert/alerts.json"
+OREF_URL = "https://christina-nonreductional-supersilently.ngrok-free.dev/api/alerts"
 OREF_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
