@@ -430,41 +430,51 @@ def main():
         "--disable-gpu",
         "--disable-software-rasterizer",
         "--disable-extensions",
-        "--mute-audio"
+        "--mute-audio",
+        "--single-process",
+        "--no-zygote",
+        "--disable-background-networking"
     ]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=chromium_args)
         context = browser.new_context(
             viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
-            device_scale_factor=2,  # Retina-quality screenshots
+            device_scale_factor=1.5,  # Reduced from 2.0 to save memory footprint
         )
         page = context.new_page()
 
         if args.output_file:
             print(f"[+] Capturing single '{args.theme}' theme to {args.output_file}...")
-            page.goto(args.url, wait_until="networkidle")
-            page.wait_for_selector(".leaflet-container", timeout=15000)
-            time.sleep(3)
-            
-            # Switch theme if needed
-            if args.theme == "light":
-                switch_theme(page, "light")
-                time.sleep(3)
+            try:
+                # Use load or domcontentloaded instead of networkidle, as networkidle can hang 
+                # indefinitely if the page has constant background polling or websockets.
+                page.goto(args.url, wait_until="load", timeout=45000)
+                page.wait_for_selector(".leaflet-container", timeout=15000)
+                time.sleep(3)  # Let map render
                 
-            hide_ui_overlays(page)
-            time.sleep(0.5)
-            
-            raw_path = capture_screenshot(page, args.theme, output_dir)
-            logo_path = LOGO_DIR / f"logo-{args.theme}-theme.png"
-            final_path = Path(args.output_file)
-            overlay_logo_and_crop(raw_path, logo_path, final_path, args.size,
-                                  active_statuses=active_statuses, theme=args.theme,
-                                  counts=status_counts)
-            print(f"  [OK] Saved: {final_path}")
-            raw_path.unlink(missing_ok=True)
-            browser.close()
-            return final_path
+                # Switch theme if needed
+                if args.theme == "light":
+                    switch_theme(page, "light")
+                    time.sleep(3)
+                    
+                hide_ui_overlays(page)
+                time.sleep(0.5)
+                
+                raw_path = capture_screenshot(page, args.theme, output_dir)
+                logo_path = LOGO_DIR / f"logo-{args.theme}-theme.png"
+                final_path = Path(args.output_file)
+                overlay_logo_and_crop(raw_path, logo_path, final_path, args.size,
+                                      active_statuses=active_statuses, theme=args.theme,
+                                      counts=status_counts)
+                print(f"  [OK] Saved: {final_path}")
+                raw_path.unlink(missing_ok=True)
+                browser.close()
+                return final_path
+            except Exception as e:
+                print(f"  [ERR] Playwright screenshot failed: {e}")
+                browser.close()
+                sys.exit(1)
             
         else:
             # Default behavior: capture both themes to the output dir
@@ -540,17 +550,20 @@ def quick_capture_and_send(bot_token: str, chat_id: str,
             "--disable-gpu",
             "--disable-software-rasterizer",
             "--disable-extensions",
-            "--mute-audio"
+            "--mute-audio",
+            "--single-process",
+            "--no-zygote",
+            "--disable-background-networking"
         ]
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=chromium_args)
             context = browser.new_context(
                 viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
-                device_scale_factor=2,
+                device_scale_factor=1.5,
             )
             page = context.new_page()
-            page.goto(url, wait_until="networkidle", timeout=30000)
+            page.goto(url, wait_until="load", timeout=30000)
             page.wait_for_selector(".leaflet-container", timeout=20000)
             time.sleep(3)
 
