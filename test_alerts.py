@@ -619,10 +619,20 @@ def main():
             cred = credentials.Certificate(cert_dict)
             print("Loaded service account from FIREBASE_SERVICE_ACCOUNT_JSON env var.")
         except Exception as e:
-            print(f"Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: {e}")
-            cred = credentials.Certificate(str(SERVICE_ACCOUNT))
-    else:
+            msg = f"Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: {e}"
+            print(msg)
+            raise RuntimeError(msg) from e
+    elif SERVICE_ACCOUNT.exists():
         cred = credentials.Certificate(str(SERVICE_ACCOUNT))
+        print(f"Loaded service account from local file: {SERVICE_ACCOUNT}")
+    else:
+        msg = (
+            f"Service account key not found! "
+            f"You must either set the 'FIREBASE_SERVICE_ACCOUNT_JSON' environment variable, "
+            f"or provide the file at '{SERVICE_ACCOUNT}'."
+        )
+        print(msg)
+        raise RuntimeError(msg)
 
     firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
 

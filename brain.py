@@ -486,10 +486,20 @@ def init_firebase():
             cred = credentials.Certificate(cert_dict)
             log.info("Loaded service account from FIREBASE_SERVICE_ACCOUNT_JSON env var.")
         except Exception as e:
-            log.error("Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: %s", e)
-            cred = credentials.Certificate(str(SERVICE_ACCOUNT_FILE))
-    else:
+            msg = f"Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: {e}. Please ensure it contains valid JSON or Base64."
+            log.error(msg)
+            raise RuntimeError(msg) from e
+    elif SERVICE_ACCOUNT_FILE.exists():
         cred = credentials.Certificate(str(SERVICE_ACCOUNT_FILE))
+        log.info("Loaded service account from local file: %s", SERVICE_ACCOUNT_FILE)
+    else:
+        msg = (
+            f"Service account key not found! "
+            f"You must either set the 'FIREBASE_SERVICE_ACCOUNT_JSON' environment variable, "
+            f"or provide the file at '{SERVICE_ACCOUNT_FILE}'."
+        )
+        log.error(msg)
+        raise RuntimeError(msg)
         
     firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
     log.info("Firebase initialized → %s", FIREBASE_DB_URL)
@@ -547,8 +557,18 @@ def fetch_oref() -> list[tuple[str, str]]:
     
     Returns a list of (city_name_he, status) tuples with priority merging.
     """
-    resp = requests.get(OREF_URL, headers=OREF_HEADERS, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
+    url = os.environ.get("OREF_URL_OVERRIDE", OREF_URL)
+    proxy_url = os.environ.get("OREF_PROXY_URL")
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
+    resp = requests.get(url, headers=OREF_HEADERS, timeout=REQUEST_TIMEOUT, proxies=proxies)
+    
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        if resp.status_code == 403:
+            log.error("HTTP 403 Forbidden from Oref. If you are deployed outside Israel, Oref's geo-blocking firewall is dropping your requests. Set OREF_PROXY_URL to an Israeli proxy.")
+        raise e
 
     text = resp.text.strip()
     if text.startswith("\ufeff"):
