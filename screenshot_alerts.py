@@ -431,8 +431,6 @@ def main():
         "--disable-software-rasterizer",
         "--disable-extensions",
         "--mute-audio",
-        "--single-process",
-        "--no-zygote",
         "--disable-background-networking"
     ]
 
@@ -551,8 +549,6 @@ def quick_capture_and_send(bot_token: str, chat_id: str,
             "--disable-software-rasterizer",
             "--disable-extensions",
             "--mute-audio",
-            "--single-process",
-            "--no-zygote",
             "--disable-background-networking"
         ]
 

@@ -1,8 +1,8 @@
 """
-Clearmap Brain — Real-time Oref alert poller + Telegram intel + Firebase sync.
+Clearmap Brain — Real-time Oref alert poller + Firebase sync.
 
 Polls the Israeli Home Front Command API every 1.5s, manages a state machine
-for each alerted city, reads Telegram intel from intel.db, and pushes the
+for each alerted city, and pushes the
 current state to Firebase Realtime Database for the Next.js frontend.
 
 State machine:
@@ -712,8 +712,7 @@ def update_state(
             # New city
             poly_data = polygons.get(city_he)
             if not poly_data:
-                if alert_type != "telegram_intel":
-                    log.warning("No polygon data for '%s' — skipping.", city_he)
+                log.warning("No polygon data for '%s' — skipping.", city_he)
                 continue
             
             cs = CityState(city_he, poly_data["city_name"], now)
@@ -773,12 +772,12 @@ def sync_uav_tracks(tracker: UavTracker):
 
 _STATUS_EMOJI = {
     "alert": "🔴", "uav": "🟣", "terrorist": "🔶",
-    "pre_alert": "🟠", "after_alert": "⚫", "telegram_intel": "🔵",
+    "pre_alert": "🟠", "after_alert": "⚫",
 }
 _STATUS_LABEL = {
     "alert": "התרעות ירי רקטות וטילים", "uav": "התרעות חדירת כלי טיס עוין",
     "terrorist": "חדירת מחבלים", "pre_alert": "התרעות מוקדמות",
-    "after_alert": "להישאר בממ\"ד", "telegram_intel": "מודיעין",
+    "after_alert": "להישאר בממ\"ד",
 }
 
 _screenshot_lock = threading.Lock()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Interactive test tool — write mock alerts to Firebase RTDB
-and inject mock Telegram messages into intel.db.
+and simulate UAV paths and mock alerts.
 
 Usage:
     python test_alerts.py
