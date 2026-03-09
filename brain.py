@@ -476,7 +476,14 @@ def load_polygons() -> dict:
 def init_firebase():
     """Initialize Firebase Admin SDK."""
     import base64
-    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON") or _cfg_env.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    env_keys = ["FIREBASE_SERVICE_ACCOUNT_JSON", "FIREBASE_SERVICE_ACCOUNT", "SERVICE_ACCOUNT_JSON"]
+    sa_json = None
+    for key in env_keys:
+        val = os.environ.get(key) or _cfg_env.get(key)
+        if val:
+            sa_json = val
+            break
+
     if sa_json:
         try:
             if sa_json.strip().startswith("{"):
