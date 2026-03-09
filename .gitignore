@@ -28,3 +28,7 @@ Thumbs.db
 
 serviceAccountKey.json
 screenshots/
+
+# Old redundant submodule copies
+RedAlert/
+idodov_RedAlert/
