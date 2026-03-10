@@ -568,8 +568,16 @@ def fetch_oref() -> list[tuple[str, str]]:
     proxy_url = os.environ.get("OREF_PROXY_URL")
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
 
-    resp = requests.get(url, headers=OREF_HEADERS, timeout=REQUEST_TIMEOUT, proxies=proxies)
-    
+    max_retries = 2
+    for attempt in range(max_retries):
+        resp = requests.get(url, headers=OREF_HEADERS, timeout=REQUEST_TIMEOUT, proxies=proxies)
+        if resp.status_code in (502, 503, 504) and attempt < max_retries - 1:
+            log.warning("Oref fetch got %d, retrying in 1s... (attempt %d/%d)",
+                        resp.status_code, attempt + 1, max_retries)
+            time.sleep(1)
+            continue
+        break
+
     try:
         resp.raise_for_status()
     except requests.exceptions.HTTPError as e:
