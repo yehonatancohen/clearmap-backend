@@ -1072,18 +1072,17 @@ def main():
     state: dict[str, CityState] = {}
     centroids = {name: _compute_centroid(p["polygon"]) for name, p in polygons.items() if p.get("polygon")}
     uav_tracker = UavTracker()
-    last_screenshot_time = 0.0
-    sliding_window_end_time = 0.0
-    pending_screenshot = False  # True when a screenshot was deferred due to cooldown
 
     # Start bot command poller in background
     if TELEGRAM_BOT_TOKEN:
         threading.Thread(target=_bot_poller, daemon=True).start()
-        log.info("📸 Screenshot broadcast enabled (cooldown=%ds)", SCREENSHOT_COOLDOWN)
+        log.info("🤖 Bot command poller started")
     else:
-        log.info("📸 Screenshot broadcast disabled (set CLEARMAP_BOT_TOKEN)")
+        log.info("🤖 Bot poller disabled (no CLEARMAP_BOT_TOKEN)")
 
-    # Clear any stale data on startup (Disabled to keep frontend state if backend restarts)
+    log.info("📸 Screenshots handled by separate clearmap-screenshots service")
+
+    # Don't clear Firebase on startup — preserve frontend state across restarts
     # sync_to_firebase(state)
     # sync_uav_tracks(uav_tracker)
 
@@ -1102,40 +1101,10 @@ def main():
                 sync_to_firebase(state)
                 sync_uav_tracks(uav_tracker)
 
-            # Slide the window if we got new actual alerts
-            now_ts = time.time()
-            if has_new_primary and TELEGRAM_BOT_TOKEN:
-                # Delay the screenshot by 10s. If it arrives within 10s of another alert, it extends the batch clock!
-                sliding_window_end_time = now_ts + 10.0
-                pending_screenshot = True
-                log.info("📸 New primary alert received! Sliding window set/pushed to 10s from now.")
-
-            # Send pending screenshot once both the sliding window and global cooldown have elapsed
-            if pending_screenshot and TELEGRAM_BOT_TOKEN:
-                if now_ts >= sliding_window_end_time:
-                    time_since_last = now_ts - last_screenshot_time
-                    if time_since_last >= SCREENSHOT_COOLDOWN:
-                        if state:
-                            log.info("📸 Cooldown & Sliding window elapsed! Triggering screenshot for %d alerts", len(state))
-                            last_screenshot_time = now_ts
-                            pending_screenshot = False
-                            state_snapshot = {k: v for k, v in state.items()}
-                            threading.Thread(
-                                target=capture_and_broadcast,
-                                args=(state_snapshot,),
-                                daemon=True,
-                            ).start()
-                        else:
-                            log.info("📸 Window elapsed but alerts cleared — cancelling pending screenshot")
-                            pending_screenshot = False
-                    else:
-                        remaining_cool = SCREENSHOT_COOLDOWN - time_since_last
-                        if int(remaining_cool) % 30 == 0 or remaining_cool > SCREENSHOT_COOLDOWN - 2:
-                            log.info("📸 Screenshot ready from batching, but waiting on global cooldown: %.0fs left", remaining_cool)
-                else:
-                    remaining_window = sliding_window_end_time - now_ts
-                    if int(remaining_window) % 3 == 0 or remaining_window > 8:
-                        log.info("📸 Waiting for alert barrage to settle... (%.1fs sliding window left)", remaining_window)
+            # NOTE: Screenshot broadcasting has been moved to a separate service
+            # (clearmap-screenshots) running on a different machine with more memory.
+            # That service watches Firebase for alert changes and handles Playwright
+            # screenshot capture + Telegram broadcasting independently.
 
         except requests.exceptions.RequestException as e:
             log.error("HTTP error: %s", e)
