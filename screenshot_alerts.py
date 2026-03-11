@@ -427,11 +427,14 @@ def main():
     chromium_args = [
         "--disable-dev-shm-usage",
         "--no-sandbox",
+        "--disable-setuid-sandbox",
         "--disable-gpu",
         "--disable-software-rasterizer",
         "--disable-extensions",
         "--mute-audio",
-        "--disable-background-networking"
+        "--disable-background-networking",
+        "--disable-site-isolation-trials",
+        "--js-flags=--max-old-space-size=512"
     ]
 
     with sync_playwright() as p:
@@ -545,11 +548,14 @@ def quick_capture_and_send(bot_token: str, chat_id: str,
         chromium_args = [
             "--disable-dev-shm-usage",
             "--no-sandbox",
+            "--disable-setuid-sandbox",
             "--disable-gpu",
             "--disable-software-rasterizer",
             "--disable-extensions",
             "--mute-audio",
-            "--disable-background-networking"
+            "--disable-background-networking",
+            "--disable-site-isolation-trials",
+            "--js-flags=--max-old-space-size=512"
         ]
 
         with sync_playwright() as p:

@@ -21,9 +21,12 @@ COPY public/ ./public/
 
 ENV PYTHONUNBUFFERED=1
 
+RUN apt-get update && apt-get install -y dumb-init && rm -rf /var/lib/apt/lists/*
+
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
     CMD python -c "import sys; sys.exit(0)"
 
 STOPSIGNAL SIGTERM
 
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["python", "brain.py"]
