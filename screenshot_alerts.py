@@ -28,7 +28,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 DEFAULT_URL = "https://clearmap.co.il"
-VIEWPORT_SIZE = 900  # square viewport
+VIEWPORT_SIZE = 600  # square viewport (kept small for low-memory containers like Koyeb)
 # Logo directory — works locally (relative path to clear-map) and in Docker (bundled)
 _LOCAL_LOGO_DIR = Path(__file__).parent.parent.parent / "clear-map" / "public"
 _DOCKER_LOGO_DIR = Path(__file__).parent / "public"
@@ -423,7 +423,7 @@ def main():
     print(f"  Size: {args.size}x{args.size}")
     print()
 
-    # Disable heavy browser features to save CPU inside the VM
+    # Disable heavy browser features to save CPU/RAM inside low-memory VMs (Koyeb etc.)
     chromium_args = [
         "--disable-dev-shm-usage",
         "--no-sandbox",
@@ -434,101 +434,123 @@ def main():
         "--mute-audio",
         "--disable-background-networking",
         "--disable-site-isolation-trials",
-        "--no-zygote",
-        "--single-process",
+        "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-ipc-flooding-protection",
         "--js-flags=--max-old-space-size=256"
     ]
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=chromium_args)
-        context = browser.new_context(
-            viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
-            device_scale_factor=1.0,  # Reduced to 1.0 for weak memory machines (e.g. Koyeb)
-        )
-        page = context.new_page()
-
-        if args.output_file:
-            print(f"[+] Capturing single '{args.theme}' theme to {args.output_file}...")
+    if args.output_file:
+        # Single-file capture mode with retry logic for low-memory environments
+        MAX_RETRIES = 3
+        for attempt in range(1, MAX_RETRIES + 1):
+            browser = None
             try:
-                # Use load or domcontentloaded instead of networkidle, as networkidle can hang 
-                # indefinitely if the page has constant background polling or websockets.
-                page.goto(args.url, wait_until="load", timeout=45000)
-                page.wait_for_selector(".leaflet-container", timeout=15000)
-                time.sleep(3)  # Let map render
-                
-                # Switch theme if needed
-                if args.theme == "light":
-                    switch_theme(page, "light")
-                    time.sleep(3)
-                    
-                hide_ui_overlays(page)
-                time.sleep(0.5)
-                
-                raw_path = capture_screenshot(page, args.theme, output_dir)
-                logo_path = LOGO_DIR / f"logo-{args.theme}-theme.png"
-                final_path = Path(args.output_file)
-                overlay_logo_and_crop(raw_path, logo_path, final_path, args.size,
-                                      active_statuses=active_statuses, theme=args.theme,
-                                      counts=status_counts)
-                print(f"  [OK] Saved: {final_path}")
-                raw_path.unlink(missing_ok=True)
-                browser.close()
-                return final_path
+                print(f"[+] Capturing single '{args.theme}' theme (attempt {attempt}/{MAX_RETRIES})...")
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True, args=chromium_args)
+                    context = browser.new_context(
+                        viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
+                        device_scale_factor=1.0,
+                    )
+                    page = context.new_page()
+
+                    page.goto(args.url, wait_until="load", timeout=45000)
+                    page.wait_for_selector(".leaflet-container", timeout=15000)
+                    time.sleep(3)  # Let map render
+
+                    # Switch theme if needed
+                    if args.theme == "light":
+                        switch_theme(page, "light")
+                        time.sleep(3)
+
+                    hide_ui_overlays(page)
+                    time.sleep(0.5)
+
+                    raw_path = capture_screenshot(page, args.theme, output_dir)
+                    logo_path = LOGO_DIR / f"logo-{args.theme}-theme.png"
+                    final_path = Path(args.output_file)
+                    overlay_logo_and_crop(raw_path, logo_path, final_path, args.size,
+                                          active_statuses=active_statuses, theme=args.theme,
+                                          counts=status_counts)
+                    print(f"  [OK] Saved: {final_path}")
+                    raw_path.unlink(missing_ok=True)
+                    browser.close()
+                    return final_path
             except Exception as e:
-                print(f"  [ERR] Playwright screenshot failed: {e}")
-                browser.close()
-                sys.exit(1)
-            
-        else:
-            # Default behavior: capture both themes to the output dir
+                print(f"  [ERR] Attempt {attempt}/{MAX_RETRIES} failed: {e}")
+                if browser:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                if attempt < MAX_RETRIES:
+                    wait_secs = attempt * 3
+                    print(f"  [RETRY] Waiting {wait_secs}s before retry...")
+                    time.sleep(wait_secs)
+                else:
+                    print(f"  [ERR] All {MAX_RETRIES} attempts failed. Giving up.")
+                    sys.exit(1)
+        
+    else:
+        # Default behavior: capture both themes to the output dir
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=chromium_args)
+            context = browser.new_context(
+                viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
+                device_scale_factor=1.0,
+            )
+            page = context.new_page()
+
             # -- Dark theme screenshot -------------------------------------------
             print("[+] Capturing dark theme...")
-            page.goto(args.url, wait_until="networkidle")
-    
+            page.goto(args.url, wait_until="load", timeout=45000)
+
             # Wait for map tiles and polygons to render
             page.wait_for_selector(".leaflet-container", timeout=15000)
             time.sleep(3)  # Let initial fitBounds or default zoom settle
-    
+
             print("  [+] Adjusting zoom level...")
             page.mouse.move(VIEWPORT_SIZE / 2, VIEWPORT_SIZE / 2)
-            page.mouse.wheel(0, 0)  # Scroll up to zoom in (less aggressive)
+            page.mouse.wheel(0, 0)
             time.sleep(2)  # Let tiles load after zoom
-    
+
             # Hide UI overlays
             hide_ui_overlays(page)
             time.sleep(0.5)
-    
+
             dark_raw = capture_screenshot(page, "dark", output_dir)
-    
+
             dark_logo = LOGO_DIR / "logo-dark-theme.png"
             dark_output = output_dir / f"alert_dark_{timestamp}.png"
             overlay_logo_and_crop(dark_raw, dark_logo, dark_output, args.size,
                                   active_statuses=active_statuses, theme="dark",
                                   counts=status_counts)
             print(f"  [OK] Saved: {dark_output}")
-    
+
             # -- Light theme screenshot ------------------------------------------
             print("[+] Capturing light theme...")
             switch_theme(page, "light")
             time.sleep(3)  # Let tiles fully reload
-    
+
             # Re-hide UI overlays
             hide_ui_overlays(page)
             time.sleep(0.5)
-    
+
             light_raw = capture_screenshot(page, "light", output_dir)
-    
+
             light_logo = LOGO_DIR / "logo-light-theme.png"
             light_output = output_dir / f"alert_light_{timestamp}.png"
             overlay_logo_and_crop(light_raw, light_logo, light_output, args.size,
                                   active_statuses=active_statuses, theme="light",
                                   counts=status_counts)
             print(f"  [OK] Saved: {light_output}")
-    
+
             # Cleanup raw files
             dark_raw.unlink(missing_ok=True)
             light_raw.unlink(missing_ok=True)
-    
+
             browser.close()
             print()
             print(f"[DONE] Screenshots saved to {output_dir}")
@@ -557,8 +579,8 @@ def quick_capture_and_send(bot_token: str, chat_id: str,
             "--mute-audio",
             "--disable-background-networking",
             "--disable-site-isolation-trials",
-            "--no-zygote",
-            "--single-process",
+            "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling",
             "--js-flags=--max-old-space-size=256"
         ]
 
