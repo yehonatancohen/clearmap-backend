@@ -1083,9 +1083,9 @@ def main():
     else:
         log.info("📸 Screenshot broadcast disabled (set CLEARMAP_BOT_TOKEN)")
 
-    # Clear any stale data on startup
-    sync_to_firebase(state)
-    sync_uav_tracks(uav_tracker)
+    # Clear any stale data on startup (Disabled to keep frontend state if backend restarts)
+    # sync_to_firebase(state)
+    # sync_uav_tracks(uav_tracker)
 
     log.info("Polling Oref every %.1fs | alert=%ds pre_alert=%ds after_alert=until_clear",
              POLL_INTERVAL, ALERT_DURATION, PRE_ALERT_TTL)

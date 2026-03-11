@@ -434,14 +434,16 @@ def main():
         "--mute-audio",
         "--disable-background-networking",
         "--disable-site-isolation-trials",
-        "--js-flags=--max-old-space-size=512"
+        "--no-zygote",
+        "--single-process",
+        "--js-flags=--max-old-space-size=256"
     ]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=chromium_args)
         context = browser.new_context(
             viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
-            device_scale_factor=1.5,  # Reduced from 2.0 to save memory footprint
+            device_scale_factor=1.0,  # Reduced to 1.0 for weak memory machines (e.g. Koyeb)
         )
         page = context.new_page()
 
@@ -555,14 +557,16 @@ def quick_capture_and_send(bot_token: str, chat_id: str,
             "--mute-audio",
             "--disable-background-networking",
             "--disable-site-isolation-trials",
-            "--js-flags=--max-old-space-size=512"
+            "--no-zygote",
+            "--single-process",
+            "--js-flags=--max-old-space-size=256"
         ]
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=chromium_args)
             context = browser.new_context(
                 viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
-                device_scale_factor=1.5,
+                device_scale_factor=1.0,  # Reduced to 1.0 for weak machines
             )
             page = context.new_page()
             page.goto(url, wait_until="load", timeout=30000)
