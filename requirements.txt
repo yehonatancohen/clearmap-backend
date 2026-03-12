@@ -1,5 +1,2 @@
 firebase-admin
 requests
-playwright
-Pillow
-python-bidi

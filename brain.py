@@ -71,8 +71,6 @@ def _load_config_env() -> dict[str, str]:
 
 _cfg_env = _load_config_env()
 TELEGRAM_BOT_TOKEN = os.environ.get("CLEARMAP_BOT_TOKEN", "") or _cfg_env.get("CLEARMAP_BOT_TOKEN", "")
-SCREENSHOT_COOLDOWN = int(os.environ.get("SCREENSHOT_COOLDOWN", "") or _cfg_env.get("SCREENSHOT_COOLDOWN", "120"))
-SCREENSHOT_URL = os.environ.get("SCREENSHOT_URL", "") or _cfg_env.get("SCREENSHOT_URL", "https://clearmap.co.il")
 
 POLYGONS_FILE = Path(os.environ.get("POLYGONS_FILE", Path(__file__).parent / "polygons.json"))
 SERVICE_ACCOUNT_FILE = Path(os.environ.get("SERVICE_ACCOUNT_FILE", Path(__file__).parent / "serviceAccountKey.json"))
@@ -776,19 +774,7 @@ def sync_uav_tracks(tracker: UavTracker):
         log.info("Firebase UAV tracks synced: %d tracks.", len(payload))
 
 
-# ── Screenshot + Telegram Bot Broadcast ─────────────────────────────────────
-
-_STATUS_EMOJI = {
-    "alert": "🔴", "uav": "🟣", "terrorist": "🔶",
-    "pre_alert": "🟠", "after_alert": "⚫",
-}
-_STATUS_LABEL = {
-    "alert": "התרעות ירי רקטות וטילים", "uav": "התרעות חדירת כלי טיס עוין",
-    "terrorist": "חדירת מחבלים", "pre_alert": "התרעות מוקדמות",
-    "after_alert": "להישאר בממ\"ד",
-}
-
-_screenshot_lock = threading.Lock()
+# ── Telegram Bot ────────────────────────────────────────────────────────────
 
 def _bot_send_message(chat_id: str, text: str):
     """Send a text message via Telegram Bot API."""
@@ -864,197 +850,6 @@ def _bot_poller():
             time.sleep(5)
 
 
-def _build_caption(state: dict) -> str:
-    """Build a Hebrew caption with alert locations, times, and website link."""
-    from collections import defaultdict
-    from datetime import datetime
-    try:
-        from district_to_areas import DISTRICT_AREAS
-    except ImportError:
-        DISTRICT_AREAS = {}
-
-    if not state:
-        return "אין התרעות פעילות"
-
-    # Build reverse mapping from city -> region
-    city_to_region = {}
-    for region, cities_list in DISTRICT_AREAS.items():
-        for c in cities_list:
-            city_to_region[c] = region
-
-    # Group cities by status
-    groups: dict[str, list[tuple[str, float]]] = defaultdict(list)
-    for city_he, cs in state.items():
-        groups[cs.state].append((cs.city_name_he, cs.started_at))
-
-    lines = []
-    # Priority order for display
-    for status in ("alert", "uav", "terrorist", "pre_alert", "after_alert"):
-        cities = groups.get(status)
-        if not cities:
-            continue
-        emoji = _STATUS_EMOJI.get(status, "❓")
-        label = _STATUS_LABEL.get(status, status)
-        
-        if status == "after_alert":
-            lines.append(f"{emoji} {len(cities)} מקומות להישאר במרחב מוגן:")
-        else:
-            lines.append(f"{emoji} {len(cities)} {label}:")
-
-        # If too many alerts of this type, group by region
-        if len(cities) > 8 and DISTRICT_AREAS:
-            reg_dict: dict[str, float] = {}
-            for city_name, ts in cities:
-                reg = city_to_region.get(city_name, city_name)
-                # Keep the newest timestamp for the region
-                if reg not in reg_dict or ts > reg_dict[reg]:
-                    reg_dict[reg] = ts
-            
-            reg_list = sorted(reg_dict.items(), key=lambda x: x[1], reverse=True)
-            for reg, ts in reg_list:
-                t = datetime.fromtimestamp(ts).strftime("%H:%M")
-                lines.append(f"  • {reg} ({t})")
-        else:
-            # Sort by time (newest first) and list city names with time
-            cities.sort(key=lambda x: x[1], reverse=True)
-            for city_name, ts in cities:
-                t = datetime.fromtimestamp(ts).strftime("%H:%M")
-                lines.append(f"  • {city_name} ({t})")
-
-    lines.append("")
-    lines.append("🗺 clearmap.co.il")
-
-    caption = "\n".join(lines)
-
-    # Telegram photo captions are limited to 1024 characters
-    if len(caption) > 1024:
-        # Truncate lists but keep the summary + link
-        summary_parts = []
-        for status in ("alert", "uav", "terrorist", "pre_alert", "after_alert"):
-            cities = groups.get(status)
-            if not cities:
-                continue
-            emoji = _STATUS_EMOJI.get(status, "❓")
-            label = _STATUS_LABEL.get(status, status)
-            if status == "after_alert":
-                summary_parts.append(f"{emoji} {len(cities)} מקומות להישאר במרחב מוגן")
-            else:
-                summary_parts.append(f"{emoji} {len(cities)} {label}")
-        caption = " | ".join(summary_parts) + "\n\n🗺 clearmap.co.il"
-
-    return caption
-
-
-def _send_photo_to_chat(chat_id: str, photo_path: Path, caption: str) -> bool:
-    """Send a photo to a single chat. Returns True on success."""
-    try:
-        with open(photo_path, "rb") as f:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                data={"chat_id": chat_id, "caption": caption},
-                files={"photo": ("alert.png", f, "image/png")},
-                timeout=30,
-            )
-        if resp.ok:
-            return True
-        else:
-            body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-            # Auto-remove subscribers who blocked the bot
-            if body.get("error_code") in (403, 400):
-                log.warning("📸 Removing blocked/invalid subscriber %s: %s",
-                            chat_id, body.get("description", ""))
-                with _subscribers_lock:
-                    _subscribers.discard(chat_id)
-                    _save_subscribers(_subscribers)
-            else:
-                log.warning("📸 sendPhoto failed for %s: %s", chat_id, resp.text[:150])
-            return False
-    except Exception as e:
-        log.error("📸 sendPhoto error for %s: %s", chat_id, e)
-        return False
-
-
-TARGET_CHANNEL_ID = "-1003879479829"
-
-def capture_and_broadcast(state: dict):
-    """Capture a screenshot and broadcast it to the main channel.
-
-    Runs in a background thread — must not raise.
-    """
-    import subprocess
-    
-    if not _screenshot_lock.acquire(blocking=False):
-        log.info("📸 Screenshot already in progress — skipping.")
-        return
-
-    try:
-        log.info("📸 Capturing screenshot for broadcast channel via subprocess...")
-
-        caption = _build_caption(state)
-        log.info("📸 Caption: %s", caption)
-
-        output_dir = Path(__file__).parent / "screenshots"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        final_path = output_dir / "broadcast_latest.png"
-        script_path = Path(__file__).parent / "screenshot_alerts.py"
-        
-        url = SCREENSHOT_URL
-        if "?" in url:
-            url += "&screenshot=true"
-        else:
-            url += "?screenshot=true"
-            
-        cmd = [
-            sys.executable, str(script_path),
-            "--url", url,
-            "--output-file", str(final_path),
-            "--theme", "dark",
-            "--size", "1080"
-        ]
-        
-        def _lower_priority():
-            if sys.platform != "win32":
-                try:
-                    os.nice(15)
-                except Exception:
-                    pass
-
-        t0 = time.time()
-        log.info("📸 Running: %s", " ".join(cmd))
-        
-        # Run playwright screenshot job in an isolated, low-priority process
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            preexec_fn=_lower_priority if sys.platform != "win32" else None,
-            timeout=120
-        )
-        
-        if result.returncode != 0:
-            log.error("📸 Screenshot subprocess failed (code=%d):\nSTDOUT: %s\nSTDERR: %s", 
-                      result.returncode, result.stdout, result.stderr)
-            return
-            
-        if not final_path.exists():
-            log.error("📸 Screenshot subprocess completed but output file missing!")
-            return
-
-        log.info("📸 Final screenshot ready (%.1fs, %.1fKB) — broadcasting to channel...",
-                 time.time() - t0, final_path.stat().st_size / 1024)
-
-        # Broadcast to channel
-        if _send_photo_to_chat(TARGET_CHANNEL_ID, final_path, caption):
-             log.info("📸 Broadcast sent to channel successfully")
-        else:
-             log.error("📸 Broadcast to channel failed")
-
-    except Exception as e:
-        log.error("📸 Screenshot/broadcast error: %s", e, exc_info=True)
-    finally:
-        _screenshot_lock.release()
-
 
 # ── Main Loop ───────────────────────────────────────────────────────────────
 
@@ -1080,7 +875,6 @@ def main():
     else:
         log.info("🤖 Bot poller disabled (no CLEARMAP_BOT_TOKEN)")
 
-    log.info("📸 Screenshots handled by separate clearmap-screenshots service")
 
     # Don't clear Firebase on startup — preserve frontend state across restarts
     # sync_to_firebase(state)
@@ -1101,10 +895,6 @@ def main():
                 sync_to_firebase(state)
                 sync_uav_tracks(uav_tracker)
 
-            # NOTE: Screenshot broadcasting has been moved to a separate service
-            # (clearmap-screenshots) running on a different machine with more memory.
-            # That service watches Firebase for alert changes and handles Playwright
-            # screenshot capture + Telegram broadcasting independently.
 
         except requests.exceptions.RequestException as e:
             log.error("HTTP error: %s", e)

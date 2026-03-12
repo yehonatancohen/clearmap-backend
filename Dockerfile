@@ -8,14 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browser + system deps for headless Chromium
-RUN playwright install --with-deps chromium
-
-# Copy brain code + screenshot module + metadata dependency
-COPY brain.py screenshot_alerts.py polygons.json district_to_areas.py ./
-
-# Copy logo assets for screenshot overlays
-COPY public/ ./public/
+COPY brain.py polygons.json district_to_areas.py ./
 
 # serviceAccountKey.json is mounted at runtime (not baked into image)
 

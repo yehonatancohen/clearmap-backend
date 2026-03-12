@@ -11,7 +11,6 @@ import json
 import math
 import os
 import re
-import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -32,58 +31,6 @@ SERVICE_ACCOUNT = Path(__file__).parent / "serviceAccountKey.json"
 POLYGONS_FILE = Path(__file__).parent / "polygons.json"
 
 STATUSES = ["alert", "pre_alert", "after_alert", "uav", "terrorist"]
-
-# ── Screenshot config (loaded from config.env) ──────────────────────────────
-def _load_screenshot_config() -> str:
-    """Read bot token from config.env."""
-    for p in (Path(__file__).parent / "config.env",
-              Path(__file__).parent.parent / "config.env"):
-        if p.exists():
-            cfg = {}
-            for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                cfg[key.strip()] = val.strip()
-            return cfg.get("CLEARMAP_BOT_TOKEN", "")
-    return ""
-
-_BOT_TOKEN = _load_screenshot_config()
-
-SUBSCRIBERS_FILE = Path(__file__).parent / "subscribers.json"
-
-# When running from test_alerts.py, screenshots go only to the developer
-_DEV_CHAT_ID = "985770181"
-_LOCALHOST_URL = "http://localhost:3000"
-_PROD_URL = "https://clearmap.co.il"
-
-
-def _load_subscribers() -> list[str]:
-    """Load subscriber chat IDs from disk."""
-    if SUBSCRIBERS_FILE.exists():
-        try:
-            return json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return []
-
-
-def _auto_send_screenshot():
-    """Capture screenshot from localhost and send only to developer."""
-    if not _BOT_TOKEN:
-        return
-    try:
-        from screenshot_alerts import quick_capture_and_send
-        print(f"\n[📸] Sending test screenshot to dev ({_DEV_CHAT_ID})...")
-        quick_capture_and_send(
-            _BOT_TOKEN, _DEV_CHAT_ID,
-            caption="🧪 Test alert screenshot",
-            url=_LOCALHOST_URL,
-        )
-    except Exception as e:
-        print(f"  [warn] Screenshot send failed: {e}")
-
 
 REGION_MAPPING = {
     "צפון": ["מחוז צפון", "מחוז גליל עליון", "מחוז גליל תחתון", "מחוז גולן",
@@ -180,7 +127,6 @@ def _send_batch(cities: list[str], polygons: dict, status: str = None):
     ref = db.reference(FIREBASE_NODE)
     ref.update(batch)
     print(f"Written {len(batch)} alerts with status={status}")
-    _auto_send_screenshot()
 
 
 def cmd_add_alert(polygons: dict):
@@ -215,7 +161,6 @@ def cmd_add_alert(polygons: dict):
     ref = db.reference(f"{FIREBASE_NODE}/{_sanitize_fb_key(city_he)}")
     ref.set(payload)
     print(f"Written: {city_he} = {status}")
-    _auto_send_screenshot()
 
 
 def cmd_batch_alert(polygons: dict):
@@ -553,33 +498,6 @@ def cmd_simulate_uav(polygons: dict):
     print(f"\nDone! {city_count} UAV alerts in {len(valid_waves)} waves written to Firebase.")
 
 
-def cmd_send_screenshot():
-    """Manually capture and send a screenshot to the developer."""
-    if not _BOT_TOKEN:
-        print("Screenshot not configured. Set CLEARMAP_BOT_TOKEN in config.env")
-        return
-
-    print("\nCapture from:")
-    print(f"  1) Localhost ({_LOCALHOST_URL})")
-    print(f"  2) Production ({_PROD_URL})")
-    choice = input("> ").strip()
-    if choice == "2":
-        url = _PROD_URL
-    else:
-        url = _LOCALHOST_URL
-
-    try:
-        from screenshot_alerts import quick_capture_and_send
-        print(f"Capturing from {url} → sending to {_DEV_CHAT_ID}...")
-        quick_capture_and_send(
-            _BOT_TOKEN, _DEV_CHAT_ID,
-            caption="📸 Manual screenshot",
-            url=url,
-        )
-    except Exception as e:
-        print(f"Failed: {e}")
-
-
 def cmd_salvo_scenario(polygons: dict):
     print("\nSalvo presets:")
     preset_names = list(SALVO_PRESETS.keys())
@@ -637,10 +555,6 @@ def main():
     firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
 
     print(f"Loaded {len(polygons)} cities.")
-    print(f"Screenshot bot: {'✅ configured' if _BOT_TOKEN else '❌ not configured (set CLEARMAP_BOT_TOKEN in config.env)'}")
-    subs = _load_subscribers()
-    if subs:
-        print(f"  📋 {len(subs)} subscribers will receive screenshots")
 
     while True:
         print("\n--- Alerts ---")
@@ -649,8 +563,6 @@ def main():
         print("--- Scenarios ---")
         print("11) Simulate UAV (Real-time/Fast-forward)")
         print("12) Salvo Attack")
-        print("--- Screenshot ---")
-        print("13) Send screenshot now")
         print("0) Exit")
         
         choice = input("> ").strip()
@@ -675,8 +587,6 @@ def main():
             cmd_simulate_uav(polygons)
         elif choice == "12":
             cmd_salvo_scenario(polygons)
-        elif choice == "13":
-            cmd_send_screenshot()
         elif choice == "0":
             break
         else:
