@@ -45,8 +45,12 @@ OREF_HEADERS = {
 FIREBASE_DB_URL = "https://clear-map-f20d0-default-rtdb.europe-west1.firebasedatabase.app/"
 FIREBASE_NODE = "/public_state/active_alerts"
 
-POLL_INTERVAL = 1.5        # seconds between API polls
+POLL_INTERVAL = 0.5        # seconds between API polls
 REQUEST_TIMEOUT = 5        # HTTP timeout in seconds
+
+# Global session to reuse TCP/TLS connections (Keep-Alive) for faster polling
+http_session = requests.Session()
+
 
 # ── Timing constants ────────────────────────────────────────────────────────
 PRE_ALERT_TTL = 720         # 12 minutes
@@ -568,7 +572,7 @@ def fetch_oref() -> list[tuple[str, str]]:
 
     max_retries = 2
     for attempt in range(max_retries):
-        resp = requests.get(url, headers=OREF_HEADERS, timeout=REQUEST_TIMEOUT, proxies=proxies)
+        resp = http_session.get(url, headers=OREF_HEADERS, timeout=REQUEST_TIMEOUT, proxies=proxies)
         if resp.status_code in (502, 503, 504) and attempt < max_retries - 1:
             log.warning("Oref fetch got %d, retrying in 1s... (attempt %d/%d)",
                         resp.status_code, attempt + 1, max_retries)
