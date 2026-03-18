@@ -29,6 +29,12 @@ import firebase_admin
 import requests
 from firebase_admin import credentials, db
 
+try:
+    from pywebpush import webpush, WebPushException
+    HAS_WEBPUSH = True
+except ImportError:
+    HAS_WEBPUSH = False
+
 # ── Config ──────────────────────────────────────────────────────────────────
 
 OREF_URL = "https://backend.clearmap.co.il/api/alerts"
@@ -75,6 +81,12 @@ def _load_config_env() -> dict[str, str]:
 
 _cfg_env = _load_config_env()
 TELEGRAM_BOT_TOKEN = os.environ.get("CLEARMAP_BOT_TOKEN", "") or _cfg_env.get("CLEARMAP_BOT_TOKEN", "")
+
+# ── Web Push (VAPID) config ──────────────────────────────────────────────────
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "") or _cfg_env.get("VAPID_PRIVATE_KEY", "")
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "") or _cfg_env.get("VAPID_PUBLIC_KEY", "")
+VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "") or _cfg_env.get("VAPID_SUBJECT", "mailto:yoncohenyon@gmail.com")
+FIREBASE_PUSH_SUBS_NODE = "/push_subscriptions"
 
 POLYGONS_FILE = Path(os.environ.get("POLYGONS_FILE", Path(__file__).parent / "polygons.json"))
 SERVICE_ACCOUNT_FILE = Path(os.environ.get("SERVICE_ACCOUNT_FILE", Path(__file__).parent / "serviceAccountKey.json"))
@@ -778,6 +790,95 @@ def sync_uav_tracks(tracker: UavTracker):
         log.info("Firebase UAV tracks synced: %d tracks.", len(payload))
 
 
+# ── Web Push Notifications ──────────────────────────────────────────────────
+
+_STATUS_LABELS = {
+    "alert": "צבע אדום!",
+    "uav": "חדירת כלי טיס עוין",
+    "terrorist": "חדירת מחבלים",
+    "pre_alert": "התרעה מוקדמת (מודיעין)",
+    "after_alert": "להישאר במרחב המוגן",
+}
+
+
+def _send_push_notifications(state: dict, new_cities: list[str]):
+    """Send web push notifications for new alerts in a background thread."""
+    if not HAS_WEBPUSH or not VAPID_PRIVATE_KEY:
+        return
+
+    # Build notification payload grouped by status
+    by_status: dict[str, list[str]] = {}
+    for city_he in new_cities:
+        cs = state.get(city_he)
+        if not cs:
+            continue
+        by_status.setdefault(cs.state, []).append(city_he)
+
+    if not by_status:
+        return
+
+    payloads = []
+    for status, cities in by_status.items():
+        title = _STATUS_LABELS.get(status, "התרעה")
+        body = ", ".join(cities[:10])
+        if len(cities) > 10:
+            body += f" +{len(cities) - 10} נוספים"
+        payloads.append({
+            "title": title,
+            "body": body,
+            "tag": f"push_{status}_{int(time.time())}",
+            "url": "https://clearmap.co.il",
+        })
+
+    def _send():
+        try:
+            subs_ref = db.reference(FIREBASE_PUSH_SUBS_NODE)
+            subs_data = subs_ref.get()
+            if not subs_data:
+                return
+
+            expired_keys = []
+            for sub_key, sub_info in subs_data.items():
+                if not isinstance(sub_info, dict) or "endpoint" not in sub_info:
+                    expired_keys.append(sub_key)
+                    continue
+
+                subscription_info = {
+                    "endpoint": sub_info["endpoint"],
+                    "keys": sub_info.get("keys", {}),
+                }
+
+                for payload in payloads:
+                    try:
+                        webpush(
+                            subscription_info=subscription_info,
+                            data=json.dumps(payload),
+                            vapid_private_key=VAPID_PRIVATE_KEY,
+                            vapid_claims={"sub": VAPID_SUBJECT},
+                        )
+                    except WebPushException as e:
+                        if e.response and e.response.status_code in (404, 410):
+                            expired_keys.append(sub_key)
+                            break
+                        log.warning("Push failed for %s: %s", sub_key, e)
+
+            # Clean up expired subscriptions
+            for key in set(expired_keys):
+                try:
+                    db.reference(f"{FIREBASE_PUSH_SUBS_NODE}/{key}").delete()
+                    log.info("Removed expired push subscription: %s", key)
+                except Exception:
+                    pass
+
+            log.info("Push notifications sent to %d subscribers (%d expired)",
+                     len(subs_data) - len(set(expired_keys)), len(set(expired_keys)))
+
+        except Exception as e:
+            log.error("Push notification batch error: %s", e)
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
 # ── Telegram Bot ────────────────────────────────────────────────────────────
 
 def _bot_send_message(chat_id: str, text: str):
@@ -899,6 +1000,12 @@ def main():
                 sync_to_firebase(state)
                 sync_uav_tracks(uav_tracker)
 
+            # Send push notifications for genuinely new primary alerts
+            if has_new_primary:
+                new_cities = [city for city, cs in state.items()
+                              if cs.state in ("alert", "uav", "terrorist", "pre_alert")]
+                if new_cities:
+                    _send_push_notifications(state, new_cities)
 
         except requests.exceptions.RequestException as e:
             log.error("HTTP error: %s", e)
