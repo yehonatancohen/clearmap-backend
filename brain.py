@@ -803,8 +803,14 @@ _STATUS_LABELS = {
 
 def _send_push_notifications(state: dict, new_cities: list[str]):
     """Send web push notifications for new alerts in a background thread."""
-    if not HAS_WEBPUSH or not VAPID_PRIVATE_KEY:
+    if not HAS_WEBPUSH:
+        log.warning("📱 Push skipped: pywebpush not installed")
         return
+    if not VAPID_PRIVATE_KEY:
+        log.warning("📱 Push skipped: VAPID_PRIVATE_KEY not set")
+        return
+
+    log.info("📱 Push: preparing for %d cities: %s", len(new_cities), ", ".join(new_cities[:5]))
 
     # Build notification payload grouped by status
     by_status: dict[str, list[str]] = {}
@@ -815,6 +821,7 @@ def _send_push_notifications(state: dict, new_cities: list[str]):
         by_status.setdefault(cs.state, []).append(city_he)
 
     if not by_status:
+        log.warning("📱 Push skipped: no matching states")
         return
 
     payloads = []
@@ -835,9 +842,13 @@ def _send_push_notifications(state: dict, new_cities: list[str]):
             subs_ref = db.reference(FIREBASE_PUSH_SUBS_NODE)
             subs_data = subs_ref.get()
             if not subs_data:
+                log.warning("📱 Push: no subscriptions found in Firebase at %s", FIREBASE_PUSH_SUBS_NODE)
                 return
 
+            log.info("📱 Push: found %d subscription(s), sending %d payload(s)", len(subs_data), len(payloads))
+
             expired_keys = []
+            sent_count = 0
             for sub_key, sub_info in subs_data.items():
                 if not isinstance(sub_info, dict) or "endpoint" not in sub_info:
                     expired_keys.append(sub_key)
@@ -856,25 +867,27 @@ def _send_push_notifications(state: dict, new_cities: list[str]):
                             vapid_private_key=VAPID_PRIVATE_KEY,
                             vapid_claims={"sub": VAPID_SUBJECT},
                         )
+                        sent_count += 1
                     except WebPushException as e:
+                        status_code = e.response.status_code if e.response else "N/A"
+                        log.warning("📱 Push failed for %s (HTTP %s): %s", sub_key, status_code, e)
                         if e.response and e.response.status_code in (404, 410):
                             expired_keys.append(sub_key)
                             break
-                        log.warning("Push failed for %s: %s", sub_key, e)
 
             # Clean up expired subscriptions
             for key in set(expired_keys):
                 try:
                     db.reference(f"{FIREBASE_PUSH_SUBS_NODE}/{key}").delete()
-                    log.info("Removed expired push subscription: %s", key)
+                    log.info("📱 Removed expired push subscription: %s", key)
                 except Exception:
                     pass
 
-            log.info("Push notifications sent to %d subscribers (%d expired)",
-                     len(subs_data) - len(set(expired_keys)), len(set(expired_keys)))
+            log.info("📱 Push complete: %d sent, %d subscribers, %d expired",
+                     sent_count, len(subs_data) - len(set(expired_keys)), len(set(expired_keys)))
 
         except Exception as e:
-            log.error("Push notification batch error: %s", e)
+            log.error("📱 Push notification batch error: %s", e, exc_info=True)
 
     threading.Thread(target=_send, daemon=True).start()
 
@@ -984,6 +997,13 @@ def main():
     # Don't clear Firebase on startup — preserve frontend state across restarts
     # sync_to_firebase(state)
     # sync_uav_tracks(uav_tracker)
+
+    # Log push notification readiness
+    if HAS_WEBPUSH and VAPID_PRIVATE_KEY:
+        log.info("📱 Web Push ENABLED (VAPID key set, pywebpush installed)")
+    else:
+        log.warning("📱 Web Push DISABLED — HAS_WEBPUSH=%s, VAPID_PRIVATE_KEY=%s",
+                     HAS_WEBPUSH, "SET" if VAPID_PRIVATE_KEY else "EMPTY")
 
     log.info("Polling Oref every %.1fs | alert=%ds pre_alert=%ds after_alert=until_clear",
              POLL_INTERVAL, ALERT_DURATION, PRE_ALERT_TTL)
