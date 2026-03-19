@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY brain.py polygons.json district_to_areas.py config.env ./
+COPY brain.py polygons.json district_to_areas.py ./
 
 # serviceAccountKey.json is mounted at runtime (not baked into image)
 
