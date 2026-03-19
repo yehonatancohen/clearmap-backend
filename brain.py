@@ -120,6 +120,13 @@ try:
 except ImportError:
     DISTRICT_AREAS = {}
 
+# ── City → Region mapping (for pre-alert area grouping) ───────────────────
+_CITY_REGIONS_FILE = Path(__file__).parent.parent / "clear-map" / "public" / "data" / "city-regions.json"
+try:
+    CITY_REGIONS: dict[str, str] = json.loads(_CITY_REGIONS_FILE.read_text(encoding="utf-8"))
+except Exception:
+    CITY_REGIONS = {}
+
 # ── Logging ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -648,22 +655,22 @@ def update_state(
     state: dict[str, CityState],
     oref_data: list[tuple[str, str]],
     polygons: dict,
-) -> tuple[bool, bool]:
+) -> tuple[bool, list[str]]:
     """
     Updates the internal state machine.
-    
+
     State machine rules:
     - pre_alert:       12 min timeout, or upgraded to alert
     - alert:           1.5 min duration, then auto → after_alert
     - after_alert:     persists until Oref "clear" signal. Re-alertable (→ alert)
-    
+
     Priority: alert > pre_alert > after_alert
-    
-    Returns: (changed_flag, has_new_primary_alert_flag)
+
+    Returns: (changed_flag, list_of_newly_alerted_city_names)
     """
     now = time.time()
     changed = False
-    has_new_primary = False
+    new_primary_cities: list[str] = []
     
     # ── Step 0: Time-based auto-transitions ──────────────────────────────
     for city_he, cs in list(state.items()):
@@ -725,7 +732,7 @@ def update_state(
                 cs.is_double = (old_state in ("alert", "uav", "terrorist", "after_alert") and alert_type in ("alert", "uav", "terrorist"))
                 changed = True
                 if alert_type in ("alert", "uav", "terrorist", "pre_alert"):
-                    has_new_primary = True
+                    new_primary_cities.append(city_he)
             elif old_state == alert_type and alert_type in ("alert", "uav", "terrorist", "pre_alert"):
                 # Same state from Oref — refresh timer only for active oref states
                 if city_he in oref_cities:
@@ -736,23 +743,23 @@ def update_state(
             if not poly_data:
                 log.warning("No polygon data for '%s' — skipping.", city_he)
                 continue
-            
+
             cs = CityState(city_he, poly_data["city_name"], now)
             cs.state = alert_type
             state[city_he] = cs
-            
+
             emoji = {"pre_alert": "🟠", "alert": "🔴", "uav": "🟣", "terrorist": "🔶", "after_alert": "⚫"}.get(alert_type, "❓")
             log.info("%s NEW %s: %s (%s)", emoji, alert_type.upper(), city_he, poly_data["city_name"])
             changed = True
             if alert_type in ("alert", "uav", "terrorist", "pre_alert"):
-                has_new_primary = True
-    
+                new_primary_cities.append(city_he)
+
     # ── Step 3: Oref signals that STOPPED ─────────────────────────────────
     # If a city was in pre_alert/alert from Oref but is no longer in Oref response,
     # let the timer handle the transition (Step 0 on next tick).
     # We do NOT force-transition here — the Oref API might just be between polls.
-    
-    return changed, has_new_primary
+
+    return changed, new_primary_cities
 
 
 # ── Firebase Sync ───────────────────────────────────────────────────────────
@@ -827,9 +834,19 @@ def _send_push_notifications(state: dict, new_cities: list[str]):
     payloads = []
     for status, cities in by_status.items():
         title = _STATUS_LABELS.get(status, "התרעה")
-        body = ", ".join(cities[:10])
-        if len(cities) > 10:
-            body += f" +{len(cities) - 10} נוספים"
+
+        if status == "pre_alert" and CITY_REGIONS:
+            # Group pre-alerts by region, show area names instead of cities
+            by_region: dict[str, list[str]] = {}
+            for c in cities:
+                region = CITY_REGIONS.get(c, "אחר")
+                by_region.setdefault(region, []).append(c)
+            body = " · ".join(f"{r} ({len(cs)})" for r, cs in by_region.items())
+        else:
+            body = ", ".join(cities[:10])
+            if len(cities) > 10:
+                body += f" +{len(cities) - 10} נוספים"
+
         payloads.append({
             "title": title,
             "body": body,
@@ -1011,7 +1028,7 @@ def main():
     while True:
         try:
             oref_data = fetch_oref()
-            changed, has_new_primary = update_state(state, oref_data, polygons)
+            changed, new_primary_cities = update_state(state, oref_data, polygons)
 
             uav_cities = {c for c, cs in state.items() if cs.state == "uav"}
             tracks_changed = uav_tracker.update(uav_cities, centroids, time.time())
@@ -1020,12 +1037,9 @@ def main():
                 sync_to_firebase(state)
                 sync_uav_tracks(uav_tracker)
 
-            # Send push notifications for genuinely new primary alerts
-            if has_new_primary:
-                new_cities = [city for city, cs in state.items()
-                              if cs.state in ("alert", "uav", "terrorist", "pre_alert")]
-                if new_cities:
-                    _send_push_notifications(state, new_cities)
+            # Send push notifications only for genuinely new/upgraded cities
+            if new_primary_cities:
+                _send_push_notifications(state, new_primary_cities)
 
         except requests.exceptions.RequestException as e:
             log.error("HTTP error: %s", e)
