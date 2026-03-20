@@ -1030,9 +1030,9 @@ def _send_push_notifications(state: dict, new_cities: list[str]):
                     continue
 
                 settings = sub_info.get("settings", {})
-                # If settings are missing, default to all-Israel for legacy support
-                all_israel = settings.get("allIsrael", True)
-                enabled = settings.get("enabled", True)
+                
+                # IMPORTANT: Default to disabled if settings missing to prevent phantom alerts
+                enabled = settings.get("enabled", False) if settings else False
                 if not enabled:
                     continue
 
