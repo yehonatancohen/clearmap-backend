@@ -651,6 +651,36 @@ def fetch_oref() -> list[tuple[str, str]]:
 # ── State Machine ───────────────────────────────────────────────────────────
 
 
+def log_history_event(status, cities):
+    """Log an event to the /public_state/history node for the frontend's history panel."""
+    if not cities:
+        return
+    try:
+        ref = db.reference("/public_state/history")
+        # Push new event
+        ref.push({
+            "status": status,
+            "cities": list(cities),
+            "timestamp": {".sv": "timestamp"}
+        })
+        # Keep only last 500 events
+        def _cleanup():
+            try:
+                # This is slightly inefficient but keeps the node clean
+                snapshot = ref.order_by_key().limit_to_first(100).get()
+                if snapshot and len(ref.get() or {}) > 500:
+                    for key in snapshot.keys():
+                        ref.child(key).delete()
+            except:
+                pass
+        # Run cleanup occasionally in background
+        if time.time() % 60 < 1: # roughly once a minute
+            threading.Thread(target=_cleanup, daemon=True).start()
+            
+    except Exception as e:
+        log.error("Failed to log history: %s", e)
+
+
 def update_state(
     state: dict[str, CityState],
     oref_data: list[tuple[str, str]],
@@ -707,13 +737,19 @@ def update_state(
     oref_cities = {city for city, _ in oref_data}
     
     # ── Step 1b: Handle clearance signals (remove from map) ────────────
+    cleared_cities = []
     for city_he, status in list(incoming.items()):
         if status == "clear":
             if city_he in state:
                 log.info("✅ CLEARED by Oref: %s", city_he)
+                cleared_cities.append(city_he)
                 del state[city_he]
                 changed = True
             del incoming[city_he]
+
+    if cleared_cities:
+        _send_clearance_notifications(cleared_cities)
+        log_history_event("clear", cleared_cities)
 
     # ── Step 2: Process incoming signals ──────────────────────────────────
     for city_he, alert_type in incoming.items():
@@ -733,6 +769,8 @@ def update_state(
                 changed = True
                 if alert_type in ("alert", "uav", "terrorist", "pre_alert"):
                     new_primary_cities.append(city_he)
+                    # For upgrades, we log individual city events
+                    log_history_event(alert_type, [city_he])
             elif old_state == alert_type and alert_type in ("alert", "uav", "terrorist", "pre_alert"):
                 # Same state from Oref — refresh timer only for active oref states
                 if city_he in oref_cities:
@@ -753,6 +791,9 @@ def update_state(
             changed = True
             if alert_type in ("alert", "uav", "terrorist", "pre_alert"):
                 new_primary_cities.append(city_he)
+                # For brand new alerts, we'll log them in bulk below if multiple arrive at once
+                # but for simplicity we can just log here if it's the first time
+                log_history_event(alert_type, [city_he])
 
     # ── Step 3: Oref signals that STOPPED ─────────────────────────────────
     # If a city was in pre_alert/alert from Oref but is no longer in Oref response,
@@ -806,6 +847,59 @@ _STATUS_LABELS = {
     "pre_alert": "התרעה מוקדמת (מודיעין)",
     "after_alert": "להישאר במרחב המוגן",
 }
+
+
+def _send_clearance_notifications(cities: list[str]):
+    """Send web push notifications when alerts are cleared."""
+    if not HAS_WEBPUSH or not VAPID_PRIVATE_KEY or not cities:
+        return
+
+    log.info("📱 Push (Clearance): preparing for %d cities", len(cities))
+
+    body = ", ".join(cities[:10])
+    if len(cities) > 10:
+        body += f" +{len(cities) - 10} נוספים"
+
+    payload = {
+        "title": "האירוע הסתיים",
+        "body": f"ניתן לצאת מהמרחב המוגן: {body}",
+        "tag": f"clearance_{int(time.time())}",
+        "url": "https://clearmap.co.il",
+    }
+
+    def _send():
+        try:
+            subs_ref = db.reference(FIREBASE_PUSH_SUBS_NODE)
+            subs_data = subs_ref.get()
+            if not subs_data:
+                return
+
+            sent_count = 0
+            for sub_key, sub_info in subs_data.items():
+                if not isinstance(sub_info, dict) or "endpoint" not in sub_info:
+                    continue
+
+                subscription_info = {
+                    "endpoint": sub_info["endpoint"],
+                    "keys": sub_info.get("keys", {}),
+                }
+
+                try:
+                    webpush(
+                        subscription_info=subscription_info,
+                        data=json.dumps(payload),
+                        vapid_private_key=VAPID_PRIVATE_KEY,
+                        vapid_claims={"sub": VAPID_SUBJECT},
+                    )
+                    sent_count += 1
+                except WebPushException:
+                    pass
+
+            log.info("📱 Clearance Push complete: %d sent", sent_count)
+        except Exception as e:
+            log.error("📱 Clearance Push error: %s", e)
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def _send_push_notifications(state: dict, new_cities: list[str]):
