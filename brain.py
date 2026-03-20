@@ -856,13 +856,24 @@ def _send_clearance_notifications(cities: list[str]):
 
     log.info("📱 Push (Clearance): preparing for %d cities", len(cities))
 
-    body = ", ".join(cities[:10])
-    if len(cities) > 10:
-        body += f" +{len(cities) - 10} נוספים"
+    # Group by region
+    by_region: dict[str, list[str]] = {}
+    for c in cities:
+        region = CITY_REGIONS.get(c, "אחר")
+        by_region.setdefault(region, []).append(c)
+
+    region_parts = []
+    for region, r_cities in by_region.items():
+        cities_str = ", ".join(r_cities[:8])
+        if len(r_cities) > 8:
+            cities_str += f" +{len(r_cities)-8}"
+        region_parts.append(f"{region}: {cities_str}")
+    
+    body = " · ".join(region_parts)
 
     payload = {
         "title": "האירוע הסתיים",
-        "body": f"ניתן לצאת מהמרחב המוגן: {body}",
+        "body": f"ניתן לצאת מהמרחב המוגן:\n{body}",
         "tag": f"clearance_{int(time.time())}",
         "url": "https://clearmap.co.il",
     }
@@ -879,15 +890,65 @@ def _send_clearance_notifications(cities: list[str]):
                 if not isinstance(sub_info, dict) or "endpoint" not in sub_info:
                     continue
 
+                settings = sub_info.get("settings", {})
+                if not settings.get("enabled", True) or not settings.get("leaveShelterAlerts", True):
+                    continue
+
+                all_israel = settings.get("allIsrael", True)
+                selected_cities = set(settings.get("selectedCities", []))
+                user_coords = sub_info.get("userCoords")
+
+                # Filter cities for this user
+                matched_cities = []
+                if all_israel:
+                    matched_cities = cities
+                else:
+                    for city_he in cities:
+                        if city_he in selected_cities:
+                            matched_cities.append(city_he)
+                            continue
+                        if user_coords and len(user_coords) == 2:
+                            city_pos = centroids.get(city_he)
+                            if city_pos:
+                                dist = _haversine_km(user_coords[0], user_coords[1], city_pos[0], city_pos[1])
+                                if dist <= 15.0:
+                                    matched_cities.append(city_he)
+                                    continue
+                
+                if not matched_cities:
+                    continue
+
+                # Group matched for this user
+                by_region_user: dict[str, list[str]] = {}
+                for c in matched_cities:
+                    region = CITY_REGIONS.get(c, "אחר")
+                    by_region_user.setdefault(region, []).append(c)
+
+                region_parts = []
+                for region, r_cities in by_region_user.items():
+                    cities_str = ", ".join(r_cities[:8])
+                    if len(r_cities) > 8:
+                        cities_str += f" +{len(r_cities)-8}"
+                    region_parts.append(f"{region}: {cities_str}")
+                
+                body_user = " · ".join(region_parts)
+
                 subscription_info = {
                     "endpoint": sub_info["endpoint"],
                     "keys": sub_info.get("keys", {}),
                 }
 
+                payload_user = {
+                    "title": "האירוע הסתיים",
+                    "body": f"ניתן לצאת מהמרחב המוגן:\n{body_user}",
+                    "tag": f"clearance_{int(time.time())}",
+                    "url": "https://clearmap.co.il",
+                }
+
                 try:
                     webpush(
                         subscription_info=subscription_info,
-                        data=json.dumps(payload),
+                        data=json.dumps(payload_user),
                         vapid_private_key=VAPID_PRIVATE_KEY,
                         vapid_claims={"sub": VAPID_SUBJECT},
                     )
@@ -929,17 +990,21 @@ def _send_push_notifications(state: dict, new_cities: list[str]):
     for status, cities in by_status.items():
         title = _STATUS_LABELS.get(status, "התרעה")
 
-        if status == "pre_alert" and CITY_REGIONS:
-            # Group pre-alerts by region, show area names instead of cities
-            by_region: dict[str, list[str]] = {}
-            for c in cities:
-                region = CITY_REGIONS.get(c, "אחר")
-                by_region.setdefault(region, []).append(c)
-            body = " · ".join(f"{r} ({len(cs)})" for r, cs in by_region.items())
-        else:
-            body = ", ".join(cities[:10])
-            if len(cities) > 10:
-                body += f" +{len(cities) - 10} נוספים"
+        # Group cities by region for all status types
+        by_region: dict[str, list[str]] = {}
+        for c in cities:
+            region = CITY_REGIONS.get(c, "אחר")
+            by_region.setdefault(region, []).append(c)
+
+        # Build body: "Region: City1, City2..."
+        region_parts = []
+        for region, r_cities in by_region.items():
+            cities_str = ", ".join(r_cities[:8])
+            if len(r_cities) > 8:
+                cities_str += f" +{len(r_cities)-8}"
+            region_parts.append(f"{region}: {cities_str}")
+        
+        body = " · ".join(region_parts)
 
         payloads.append({
             "title": title,
@@ -953,24 +1018,89 @@ def _send_push_notifications(state: dict, new_cities: list[str]):
             subs_ref = db.reference(FIREBASE_PUSH_SUBS_NODE)
             subs_data = subs_ref.get()
             if not subs_data:
-                log.warning("📱 Push: no subscriptions found in Firebase at %s", FIREBASE_PUSH_SUBS_NODE)
+                log.warning("📱 Push: no subscriptions found")
                 return
 
-            log.info("📱 Push: found %d subscription(s), sending %d payload(s)", len(subs_data), len(payloads))
-
-            expired_keys = []
             sent_count = 0
+            expired_keys = []
+
             for sub_key, sub_info in subs_data.items():
                 if not isinstance(sub_info, dict) or "endpoint" not in sub_info:
                     expired_keys.append(sub_key)
                     continue
+
+                settings = sub_info.get("settings", {})
+                # If settings are missing, default to all-Israel for legacy support
+                all_israel = settings.get("allIsrael", True)
+                enabled = settings.get("enabled", True)
+                if not enabled:
+                    continue
+
+                selected_cities = set(settings.get("selectedCities", []))
+                user_coords = sub_info.get("userCoords") # [lat, lng]
+
+                # Filter status types (pre_alert, leave_shelter)
+                # Note: 'leave_shelter' corresponds to 'clear' in backend
+                early_alerts_enabled = settings.get("earlyAlerts", True)
+                # leave_shelter is handled in _send_clearance_notifications
 
                 subscription_info = {
                     "endpoint": sub_info["endpoint"],
                     "keys": sub_info.get("keys", {}),
                 }
 
-                for payload in payloads:
+                for status, cities in by_status.items():
+                    if status == "pre_alert" and not early_alerts_enabled:
+                        continue
+
+                    # Determine which cities in this status match this user's filter
+                    matched_cities = []
+                    if all_israel:
+                        matched_cities = cities
+                    else:
+                        for city_he in cities:
+                            # 1. Direct city match
+                            if city_he in selected_cities:
+                                matched_cities.append(city_he)
+                                continue
+                            
+                            # 2. Location proximity (15km radius)
+                            if user_coords and len(user_coords) == 2:
+                                city_pos = centroids.get(city_he)
+                                if city_pos:
+                                    dist = _haversine_km(user_coords[0], user_coords[1], city_pos[0], city_pos[1])
+                                    if dist <= 15.0:
+                                        matched_cities.append(city_he)
+                                        continue
+
+                    if not matched_cities:
+                        continue
+
+                    # Construct per-user payload
+                    title = _STATUS_LABELS.get(status, "התרעה")
+                    
+                    # Group matched cities by region
+                    by_region_user: dict[str, list[str]] = {}
+                    for c in matched_cities:
+                        region = CITY_REGIONS.get(c, "אחר")
+                        by_region_user.setdefault(region, []).append(c)
+
+                    region_parts = []
+                    for region, r_cities in by_region_user.items():
+                        cities_str = ", ".join(r_cities[:8])
+                        if len(r_cities) > 8:
+                            cities_str += f" +{len(r_cities)-8}"
+                        region_parts.append(f"{region}: {cities_str}")
+                    
+                    body = " · ".join(region_parts)
+
+                    payload = {
+                        "title": title,
+                        "body": body,
+                        "tag": f"push_{status}_{int(time.time())}",
+                        "url": "https://clearmap.co.il",
+                    }
+
                     try:
                         webpush(
                             subscription_info=subscription_info,
@@ -980,25 +1110,19 @@ def _send_push_notifications(state: dict, new_cities: list[str]):
                         )
                         sent_count += 1
                     except WebPushException as e:
-                        status_code = e.response.status_code if e.response else "N/A"
-                        log.warning("📱 Push failed for %s (HTTP %s): %s", sub_key, status_code, e)
                         if e.response and e.response.status_code in (404, 410):
                             expired_keys.append(sub_key)
                             break
 
-            # Clean up expired subscriptions
-            for key in set(expired_keys):
+            # Clean up expired
+            for k in set(expired_keys):
                 try:
-                    db.reference(f"{FIREBASE_PUSH_SUBS_NODE}/{key}").delete()
-                    log.info("📱 Removed expired push subscription: %s", key)
-                except Exception:
-                    pass
+                    db.reference(f"{FIREBASE_PUSH_SUBS_NODE}/{k}").delete()
+                except: pass
 
-            log.info("📱 Push complete: %d sent, %d subscribers, %d expired",
-                     sent_count, len(subs_data) - len(set(expired_keys)), len(set(expired_keys)))
-
+            log.info("📱 Push complete: %d sent", sent_count)
         except Exception as e:
-            log.error("📱 Push notification batch error: %s", e, exc_info=True)
+            log.error("📱 Push error: %s", e, exc_info=True)
 
     threading.Thread(target=_send, daemon=True).start()
 
