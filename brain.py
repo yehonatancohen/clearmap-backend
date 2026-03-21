@@ -1037,6 +1037,7 @@ def _send_push_notifications(state: dict, new_cities: list[str]):
                     continue
 
                 selected_cities = set(settings.get("selectedCities", []))
+                all_israel = settings.get("allIsrael", True)
                 user_coords = sub_info.get("userCoords") # [lat, lng]
 
                 # Filter status types (pre_alert, leave_shelter)
