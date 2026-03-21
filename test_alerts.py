@@ -90,6 +90,54 @@ SALVO_PRESETS = {
     ],
 }
 
+# Elongated city patterns for testing impact ellipse visualization.
+# Cities in each preset are within ~15km of their neighbors so the
+# clustering algorithm groups them into a single ellipse.
+ELLIPSE_PRESETS = {
+    "N→S Strip (Herzliya → Bat Yam)": [
+        "הרצליה - מרכז וגליל ים", "רמת השרון",
+        "תל אביב - עבר הירקון", "תל אביב - מרכז העיר",
+        "תל אביב - דרום העיר ויפו", "חולון", "בת ים",
+    ],
+    "E→W Strip (Bnei Brak → Herzliya)": [
+        "בני ברק", "רמת גן - מערב", "רמת גן - מזרח",
+        "גבעתיים", "תל אביב - מזרח", "תל אביב - מרכז העיר",
+        "הרצליה - מערב",
+    ],
+    "Diagonal NE→SW (Kfar Saba → Rishon)": [
+        "כפר סבא", "רעננה", "הוד השרון", "רמת השרון",
+        "תל אביב - עבר הירקון", "תל אביב - מרכז העיר",
+        "חולון", "ראשון לציון - מערב",
+    ],
+    "Haifa Bay Strip (Krayot → Tirat Carmel)": [
+        "חיפה - קריית חיים ושמואל", "קריית ביאליק", "קריית מוצקין",
+        "קריית ים", "קריית אתא", "נשר", "טירת כרמל",
+    ],
+    "Iran Ballistic (Massive E→W Blob)": [
+        "מעלה אדומים", "ירושלים - מזרח", "ירושלים - מרכז", "ירושלים - מערב",
+        "מבשרת ציון", "אבו גוש", "מודיעין מכבים רעות", "מודיעין עילית",
+        "בית שמש", "רמלה", "לוד", "ראשון לציון - מזרח", "ראשון לציון - מערב",
+        "נס ציונה", "רחובות", "יבנה", "גן יבנה", "גדרה", 
+        "אשדוד - א,ב,ד,ה", "אשדוד - ג,ו,ז", "אשדוד - ח,ט,י,יג,יד,טז", "פלמחים"
+    ],
+    "Lebanon Massive Barrage (Dense N→S)": [
+        "מטולה", "קריית שמונה", "כפר גלעדי", "משגב עם", "מרגליות", "מנרה", "יפתח",
+        "רמות נפתלי", "דישון", "מלכיה", "יסוד המעלה", "חולתה", "ראש פינה",
+        "חצור הגלילית", "צפת", "מחניים", "עמיעד", "אלמגור", "חוקוק",
+        "טבריה", "מגדל", "גינוסר", "כפר כנא", "עילבון"
+    ],
+    "Huge Gaza Barrage (Dense SW Blob)": [
+        "נתיב העשרה", "יד מרדכי", "זיקים", "כרמיה", "אשקלון - דרום", "אשקלון - צפון",
+        "כפר סילבר", "שדה עוזיהו", "אשדוד - א,ב,ד,ה", "אשדוד - ח,ט,י,יג,יד,טז",
+        "נירים", "עין השלושה", "נחל עוז", "כפר עזה", "סעד", "שדרות, איבים, ניר עם"
+    ],
+    "Gush Dan Giant Circle (Dense City Group)": [
+        "תל אביב - מזרח", "תל אביב - עבר הירקון", "תל אביב - דרום העיר ויפו", "תל אביב - מרכז העיר",
+        "חולון", "בת ים", "בני ברק", "רמת גן - מערב", "רמת גן - מזרח", "גבעתיים", 
+        "פתח תקווה", "רמת השרון", "הרצליה - מרכז וגליל ים", "הוד השרון"
+    ]
+}
+
 def _sanitize_fb_key(key: str) -> str:
     return re.sub(r'[.$/\[\]#]', '_', key)
 
@@ -520,6 +568,33 @@ def cmd_salvo_scenario(polygons: dict):
     _send_batch(cities, polygons, status="alert")
 
 
+def cmd_ellipse_scenario(polygons: dict):
+    """Fire an elongated pattern of alerts to test the impact ellipse visualization."""
+    print("\nEllipse test presets (elongated patterns):")
+    preset_names = list(ELLIPSE_PRESETS.keys())
+    for i, name in enumerate(preset_names):
+        cities = ELLIPSE_PRESETS[name]
+        valid = sum(1 for c in cities if c in polygons)
+        print(f"  {i}: {name}  ({valid}/{len(cities)} valid)")
+
+    try:
+        idx = int(input("Pick preset: ").strip())
+        preset_name = preset_names[idx]
+    except (ValueError, IndexError):
+        print("Invalid selection.")
+        return
+
+    cities = [c for c in ELLIPSE_PRESETS[preset_name] if c in polygons]
+    if len(cities) < 3:
+        print(f"Only {len(cities)} valid cities found — need at least 3 for an ellipse.")
+        return
+
+    print(f"Firing ellipse pattern: {len(cities)} cities")
+    for c in cities:
+        print(f"  • {c}")
+    _send_batch(cities, polygons, status="alert")
+
+
 def main():
     # Load polygons
     with open(POLYGONS_FILE, encoding="utf-8") as f:
@@ -563,6 +638,7 @@ def main():
         print("--- Scenarios ---")
         print("11) Simulate UAV (Real-time/Fast-forward)")
         print("12) Salvo Attack")
+        print("13) Ellipse Pattern (Impact Zone Test)")
         print("0) Exit")
         
         choice = input("> ").strip()
@@ -587,6 +663,8 @@ def main():
             cmd_simulate_uav(polygons)
         elif choice == "12":
             cmd_salvo_scenario(polygons)
+        elif choice == "13":
+            cmd_ellipse_scenario(polygons)
         elif choice == "0":
             break
         else:
