@@ -1221,14 +1221,6 @@ def main():
     centroids = {name: _compute_centroid(p["polygon"]) for name, p in polygons.items() if p.get("polygon")}
     uav_tracker = UavTracker()
 
-    # Start bot command poller in background
-    if TELEGRAM_BOT_TOKEN:
-        threading.Thread(target=_bot_poller, daemon=True).start()
-        log.info("🤖 Bot command poller started")
-    else:
-        log.info("🤖 Bot poller disabled (no CLEARMAP_BOT_TOKEN)")
-
-
     # Don't clear Firebase on startup — preserve frontend state across restarts
     # sync_to_firebase(state)
     # sync_uav_tracks(uav_tracker)
