@@ -25,7 +25,6 @@ from typing import Optional
 
 R_EARTH = 6371.0          # km
 MIN_AXIS_KM = 1.5         # minimum semi-axis length
-MIN_AXIS_RATIO = 1.5      # minimum major/minor ratio (range error > deflection)
 CLUSTER_DISTANCE_KM = 30  # max distance for spatial clustering
 CLUSTER_TIME_WINDOW_S = 60  # alerts within this window are same-barrage
 
@@ -67,10 +66,12 @@ def chi2_scale(confidence: float) -> float:
     return math.sqrt(-2.0 * math.log(1.0 - confidence))
 
 
-# ── Load city database ───────────────────────────────────────────────────────
+# ── Load databases ──────────────────────────────────────────────────────────
 
 _CITY_DB_PATH = Path(__file__).parent / "city_db.json"
+_POLYGONS_PATH = Path(__file__).parent / "polygons.json"
 _city_db: dict[str, dict] = {}
+_polygons: dict[str, dict] = {}
 
 
 def _load_city_db() -> dict[str, dict]:
@@ -79,6 +80,18 @@ def _load_city_db() -> dict[str, dict]:
         with open(_CITY_DB_PATH, "r", encoding="utf-8") as f:
             _city_db = json.load(f)
     return _city_db
+
+
+def _load_polygons() -> dict[str, dict]:
+    global _polygons
+    if not _polygons:
+        if _POLYGONS_PATH.exists():
+            with open(_POLYGONS_PATH, "r", encoding="utf-8") as f:
+                _polygons = json.load(f)
+        else:
+            # Fallback for local development or missing file
+            _polygons = {}
+    return _polygons
 
 
 # ── Projection helpers ───────────────────────────────────────────────────────
@@ -150,11 +163,13 @@ def _estimate_origin(
 # ── Max-extent along trajectory axes ────────────────────────────────────────
 
 def _trajectory_locked_extent(
-    points: list[tuple[float, float]],
-    radii: list[float],
+    cities: list[dict],
+    polygons_db: dict,
+    center_lat: float,
+    center_lon: float,
     bearing_deg: float,
 ) -> tuple[float, float]:
-    """Project city circles (centroid + radius) onto trajectory-locked axes.
+    """Project all polygon boundary points onto trajectory-locked axes.
 
     Returns (extent_major, extent_minor): the robust-max furthest alert-zone
     edge distance from center along each axis. Uses IQR outlier filtering.
@@ -172,9 +187,27 @@ def _trajectory_locked_extent(
     proj_maj = []
     proj_min = []
 
-    for (x, y), r in zip(points, radii):
-        proj_maj.append(abs(x * traj_x + y * traj_y) + r)
-        proj_min.append(abs(x * perp_x + y * perp_y) + r)
+    # Projection center cos_lat
+    cos_ref = math.cos(math.radians(center_lat))
+
+    for city in cities:
+        name = city.get("city_name") or city.get("city_name_he")
+        poly_rec = polygons_db.get(name) if name else None
+        
+        if poly_rec and "polygon" in poly_rec:
+            # Use actual polygon points
+            for lat, lon in poly_rec["polygon"]:
+                x = math.radians(lon - center_lon) * cos_ref * R_EARTH
+                y = math.radians(lat - center_lat) * R_EARTH
+                proj_maj.append(x * traj_x + y * traj_y)
+                proj_min.append(x * perp_x + y * perp_y)
+        else:
+            # Fallback to centroid + radius if polygon is missing
+            x, y = _to_xy(city["lat"], city["lon"], center_lat, center_lon)
+            r = max(city.get("radius_km", 0.5), 0.5)
+            # Add radius buffer as it's just a single point
+            proj_maj.append(abs(x * traj_x + y * traj_y) + r)
+            proj_min.append(abs(x * perp_x + y * perp_y) + r)
 
     return robust_max(proj_maj), robust_max(proj_min)
 
@@ -188,7 +221,6 @@ def _make_result(
     outer_minor: float,
     rotation_deg: float,
     point_count: int,
-    enforce_ratio: bool = True,
 ) -> dict:
     """Build the standardized result dict with inner/outer confidence ellipses.
 
@@ -199,10 +231,6 @@ def _make_result(
 
     outer_major = max(outer_major * OUTER_PADDING, MIN_AXIS_KM)
     outer_minor = max(outer_minor * OUTER_PADDING, MIN_AXIS_KM)
-
-    # Enforce minimum axis ratio (range error > deflection error)
-    if enforce_ratio and outer_major / max(outer_minor, 0.1) < MIN_AXIS_RATIO:
-        outer_major = max(outer_major, outer_minor * MIN_AXIS_RATIO)
 
     sigma_major = outer_major
     sigma_minor = outer_minor
@@ -254,7 +282,7 @@ def compute_ellipse(zone_names: list[str]) -> Optional[dict]:
         c = cities[0]
         # City radius is the ~95% region; pass directly as outer axis
         outer_r = max(c["radius_km"], MIN_AXIS_KM)
-        return _make_result(c["lat"], c["lon"], outer_r, outer_r, 0, 1, enforce_ratio=False)
+        return _make_result(c["lat"], c["lon"], outer_r, outer_r, 0, 1)
 
     # ── N = 2: line between two cities ───────────────────────────────────
     if n == 2:
@@ -346,8 +374,18 @@ def compute_ellipse(zone_names: list[str]) -> Optional[dict]:
     # 6. Determine orientation
     rotation = launch_bearing if is_confident else free_pca_angle
 
-    # 7. Outer = max extent of city circles along each axis (bounding-box)
-    outer_major, outer_minor = _trajectory_locked_extent(points, radii, rotation)
+    # 7. Outer = bounding extent along each axis
+    polygons_db = _load_polygons()
+    extent_major, extent_minor = _trajectory_locked_extent(
+        cities, polygons_db, center_lat, center_lon, rotation
+    )
+
+    # If data is wider perpendicular to trajectory, swap axes and rotate 90°
+    if extent_major >= extent_minor:
+        outer_major, outer_minor = extent_major, extent_minor
+    else:
+        outer_major, outer_minor = extent_minor, extent_major
+        rotation = (rotation + 90) % 360
 
     return _make_result(center_lat, center_lon, outer_major, outer_minor, rotation, n)
 
