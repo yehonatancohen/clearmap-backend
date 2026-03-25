@@ -26,13 +26,35 @@ from typing import Optional
 R_EARTH = 6371.0          # km
 MIN_AXIS_KM = 1.5         # minimum semi-axis length
 MIN_AXIS_RATIO = 1.5      # minimum major/minor ratio (range error > deflection)
+CLUSTER_DISTANCE_KM = 30  # max distance for spatial clustering
+CLUSTER_TIME_WINDOW_S = 60  # alerts within this window are same-barrage
 
 # Default confidence levels
 OUTER_CONFIDENCE = 0.95
 INNER_CONFIDENCE = 0.50
-OUTER_PADDING = 1.05      # 5% padding to cover polygon edges
+OUTER_PADDING = 1.08      # 8% padding to cover polygon edges beyond centroids
 
-# ── Chi-squared scale ───────────────────────────────────────────────────────
+
+# ── IQR-based outlier filter ────────────────────────────────────────────────
+
+def robust_max(values: list[float]) -> float:
+    """IQR-based outlier filter: returns the max value that isn't a statistical
+    extreme outlier. Only excludes points beyond Q3 + 2×IQR (very permissive).
+    Keeps all legitimate barrage cities, only drops truly anomalous distances."""
+    if not values:
+        return 0.0
+    abs_vals = sorted(abs(v) for v in values)
+    if len(abs_vals) < 4:
+        return abs_vals[-1]
+    q1 = abs_vals[len(abs_vals) // 4]
+    q3 = abs_vals[(3 * len(abs_vals)) // 4]
+    iqr = q3 - q1
+    upper_fence = q3 + 2.0 * iqr
+    filtered = [v for v in abs_vals if v <= upper_fence]
+    return filtered[-1] if filtered else abs_vals[-1]
+
+
+# ── Projection helpers ───────────────────────────────────────────────────────
 
 def chi2_scale(confidence: float) -> float:
     """
@@ -134,8 +156,8 @@ def _trajectory_locked_extent(
 ) -> tuple[float, float]:
     """Project city circles (centroid + radius) onto trajectory-locked axes.
 
-    Returns (extent_major, extent_minor): the furthest alert-zone edge
-    distance from center along each axis.
+    Returns (extent_major, extent_minor): the robust-max furthest alert-zone
+    edge distance from center along each axis. Uses IQR outlier filtering.
     """
     b_rad = math.radians(bearing_deg)
 
@@ -147,16 +169,14 @@ def _trajectory_locked_extent(
     perp_x = math.cos(b_rad)
     perp_y = -math.sin(b_rad)
 
-    max_maj = 0.0
-    max_min = 0.0
+    proj_maj = []
+    proj_min = []
 
     for (x, y), r in zip(points, radii):
-        p_maj = abs(x * traj_x + y * traj_y) + r
-        p_min = abs(x * perp_x + y * perp_y) + r
-        max_maj = max(max_maj, p_maj)
-        max_min = max(max_min, p_min)
+        proj_maj.append(abs(x * traj_x + y * traj_y) + r)
+        proj_min.append(abs(x * perp_x + y * perp_y) + r)
 
-    return max_maj, max_min
+    return robust_max(proj_maj), robust_max(proj_min)
 
 
 # ── Result builder ──────────────────────────────────────────────────────────
