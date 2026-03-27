@@ -270,6 +270,10 @@ def cmd_region_alert(polygons: dict):
 
 
 def cmd_clear_all():
+    confirm = input("⚠️ Are you sure you want to clear ALL alerts (test and real)? (y/N): ").strip().lower()
+    if confirm != "y":
+        print("Clear all cancelled.")
+        return
     db.reference(FIREBASE_NODE).set({})
     db.reference(FIREBASE_UAV_NODE).set({})
     print("All alerts and UAV tracks cleared.")
