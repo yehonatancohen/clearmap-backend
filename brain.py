@@ -685,6 +685,7 @@ def update_state(
     state: dict[str, CityState],
     oref_data: list[tuple[str, str]],
     polygons: dict,
+    centroids: dict = {},
 ) -> tuple[bool, list[str]]:
     """
     Updates the internal state machine.
@@ -748,7 +749,7 @@ def update_state(
             del incoming[city_he]
 
     if cleared_cities:
-        _send_clearance_notifications(cleared_cities)
+        _send_clearance_notifications(cleared_cities, centroids)
         log_history_event("clear", cleared_cities)
 
     # ── Step 2: Process incoming signals ──────────────────────────────────
@@ -849,7 +850,7 @@ _STATUS_LABELS = {
 }
 
 
-def _send_clearance_notifications(cities: list[str]):
+def _send_clearance_notifications(cities: list[str], centroids: dict = {}):
     """Send web push notifications when alerts are cleared."""
     if not HAS_WEBPUSH or not VAPID_PRIVATE_KEY or not cities:
         return
@@ -963,7 +964,7 @@ def _send_clearance_notifications(cities: list[str]):
     threading.Thread(target=_send, daemon=True).start()
 
 
-def _send_push_notifications(state: dict, new_cities: list[str]):
+def _send_push_notifications(state: dict, new_cities: list[str], centroids: dict = {}):
     """Send web push notifications for new alerts in a background thread."""
     if not HAS_WEBPUSH:
         log.warning("📱 Push skipped: pywebpush not installed")
@@ -1029,10 +1030,10 @@ def _send_push_notifications(state: dict, new_cities: list[str]):
                     expired_keys.append(sub_key)
                     continue
 
-                settings = sub_info.get("settings", {})
-                
-                # IMPORTANT: Default to disabled if settings missing to prevent phantom alerts
-                enabled = settings.get("enabled", False) if settings else False
+                settings = sub_info.get("settings") or {}
+
+                # Default to enabled if settings are missing (consistent with clearance behavior)
+                enabled = settings.get("enabled", True)
                 if not enabled:
                     continue
 
@@ -1239,7 +1240,7 @@ def main():
     while True:
         try:
             oref_data = fetch_oref()
-            changed, new_primary_cities = update_state(state, oref_data, polygons)
+            changed, new_primary_cities = update_state(state, oref_data, polygons, centroids)
 
             uav_cities = {c for c, cs in state.items() if cs.state == "uav"}
             tracks_changed = uav_tracker.update(uav_cities, centroids, time.time())
@@ -1250,7 +1251,7 @@ def main():
 
             # Send push notifications only for genuinely new/upgraded cities
             if new_primary_cities:
-                _send_push_notifications(state, new_primary_cities)
+                _send_push_notifications(state, new_primary_cities, centroids)
 
         except requests.exceptions.RequestException as e:
             log.error("HTTP error: %s", e)
