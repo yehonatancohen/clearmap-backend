@@ -121,7 +121,7 @@ except ImportError:
     DISTRICT_AREAS = {}
 
 # ── City → Region mapping (for pre-alert area grouping) ───────────────────
-_CITY_REGIONS_FILE = Path(__file__).parent.parent / "clear-map" / "public" / "data" / "city-regions.json"
+_CITY_REGIONS_FILE = Path(__file__).parent / "city-regions.json"
 try:
     CITY_REGIONS: dict[str, str] = json.loads(_CITY_REGIONS_FILE.read_text(encoding="utf-8"))
 except Exception:
