@@ -841,6 +841,21 @@ def sync_uav_tracks(tracker: UavTracker):
 
 # ── Web Push Notifications ──────────────────────────────────────────────────
 
+def _normalize_coords(raw) -> list | None:
+    """Normalize userCoords from Firebase.
+    Firebase serializes JS arrays as {"0": lat, "1": lng} (string keys),
+    so we must handle both list and dict formats.
+    """
+    if isinstance(raw, (list, tuple)) and len(raw) == 2:
+        return [float(raw[0]), float(raw[1])]
+    if isinstance(raw, dict) and len(raw) == 2:
+        try:
+            keys = sorted(raw.keys(), key=lambda k: int(k))
+            return [float(raw[keys[0]]), float(raw[keys[1]])]
+        except (ValueError, TypeError):
+            return None
+    return None
+
 _STATUS_LABELS = {
     "alert": "צבע אדום!",
     "uav": "חדירת כלי טיס עוין",
@@ -897,7 +912,7 @@ def _send_clearance_notifications(cities: list[str], centroids: dict = {}):
 
                 all_israel = settings.get("allIsrael", True)
                 selected_cities = set(settings.get("selectedCities", []))
-                user_coords = sub_info.get("userCoords")
+                user_coords = _normalize_coords(sub_info.get("userCoords"))
 
                 # Filter cities for this user
                 matched_cities = []
@@ -1039,7 +1054,7 @@ def _send_push_notifications(state: dict, new_cities: list[str], centroids: dict
 
                 selected_cities = set(settings.get("selectedCities", []))
                 all_israel = settings.get("allIsrael", True)
-                user_coords = sub_info.get("userCoords") # [lat, lng]
+                user_coords = _normalize_coords(sub_info.get("userCoords"))
 
                 # Filter status types (pre_alert, leave_shelter)
                 # Note: 'leave_shelter' corresponds to 'clear' in backend
