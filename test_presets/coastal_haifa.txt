@@ -1,0 +1,12 @@
+# Coastal Haifa barrage — tests the coastal ellipse mirror
+# One city name per line (Hebrew). Partial names are matched automatically.
+חיפה - קריית חיים ושמואל
+קריית ביאליק
+קריית מוצקין
+קריית ים
+קריית אתא
+חיפה - מפרץ
+חיפה - כרמל, הדר ועיר תחתית
+נשר
+טירת כרמל
+עתלית

@@ -24,6 +24,8 @@ try:
 except ImportError:
     DISTRICT_AREAS = {}
 
+TEST_PRESETS_DIR = Path(__file__).parent / "test_presets"
+
 FIREBASE_DB_URL = "https://clear-map-f20d0-default-rtdb.europe-west1.firebasedatabase.app/"
 FIREBASE_NODE = "/public_state/active_alerts"
 FIREBASE_UAV_NODE = "/public_state/uav_tracks"
@@ -572,12 +574,82 @@ def cmd_salvo_scenario(polygons: dict):
     _send_batch(cities, polygons, status="alert")
 
 
+def _resolve_city(name: str, polygons: dict) -> str | None:
+    """Try to match a city name string to a polygons key.
+
+    Tries in order:
+      1. Exact match
+      2. Input is a substring of a key
+      3. Key is a substring of input
+    Returns the first match, or None.
+    """
+    name = name.strip()
+    if not name:
+        return None
+    if name in polygons:
+        return name
+    # substring: input contained in key
+    for k in polygons:
+        if name in k:
+            return k
+    # substring: key contained in input
+    for k in polygons:
+        if k in name:
+            return k
+    return None
+
+
+def load_file_presets(polygons: dict) -> dict[str, list[str]]:
+    """Load preset .txt files from test_presets/.
+
+    Each file: one city name per line (Hebrew). Lines starting with # are comments.
+    Names are resolved with fuzzy substring matching against polygon keys.
+    Returns a dict of preset_name → [resolved_city_key, ...].
+    """
+    if not TEST_PRESETS_DIR.exists():
+        return {}
+
+    presets: dict[str, list[str]] = {}
+    for f in sorted(TEST_PRESETS_DIR.glob("*.txt")):
+        lines = f.read_text(encoding="utf-8").splitlines()
+        # Support both newline-separated and comma-separated names (mixed is fine).
+        raw = []
+        for l in lines:
+            l = l.strip()
+            if not l or l.startswith("#"):
+                continue
+            for part in l.split(","):
+                part = part.strip()
+                if part:
+                    raw.append(part)
+        resolved = []
+        unmatched = []
+        for line in raw:
+            key = _resolve_city(line, polygons)
+            if key:
+                resolved.append(key)
+            else:
+                unmatched.append(line)
+        if unmatched:
+            print(f"  [presets/{f.name}] unmatched cities: {', '.join(unmatched)}")
+        if resolved:
+            presets[f.stem] = resolved
+    return presets
+
+
 def cmd_ellipse_scenario(polygons: dict):
     """Fire an elongated pattern of alerts to test the impact ellipse visualization."""
-    print("\nEllipse test presets (elongated patterns):")
-    preset_names = list(ELLIPSE_PRESETS.keys())
+    # Merge hardcoded presets with any .txt files in test_presets/
+    file_presets = load_file_presets(polygons)
+    all_presets: dict[str, list[str]] = {}
+    for name, cities in file_presets.items():
+        all_presets[f"📄 {name}"] = cities
+    all_presets.update(ELLIPSE_PRESETS)
+
+    print("\nEllipse test presets:")
+    preset_names = list(all_presets.keys())
     for i, name in enumerate(preset_names):
-        cities = ELLIPSE_PRESETS[name]
+        cities = all_presets[name]
         valid = sum(1 for c in cities if c in polygons)
         print(f"  {i}: {name}  ({valid}/{len(cities)} valid)")
 
@@ -588,7 +660,7 @@ def cmd_ellipse_scenario(polygons: dict):
         print("Invalid selection.")
         return
 
-    cities = [c for c in ELLIPSE_PRESETS[preset_name] if c in polygons]
+    cities = [c for c in all_presets[preset_name] if c in polygons]
     if len(cities) < 3:
         print(f"Only {len(cities)} valid cities found — need at least 3 for an ellipse.")
         return
