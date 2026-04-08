@@ -88,6 +88,9 @@ VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "") or _cfg_env.get("VAPID
 VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "") or _cfg_env.get("VAPID_SUBJECT", "mailto:yoncohenyon@gmail.com")
 FIREBASE_PUSH_SUBS_NODE = "/push_subscriptions"
 
+# Limit concurrent push threads so a barrage doesn't pile up hundreds of stalled threads
+_push_semaphore = threading.Semaphore(2)
+
 POLYGONS_FILE = Path(os.environ.get("POLYGONS_FILE", Path(__file__).parent / "polygons.json"))
 SERVICE_ACCOUNT_FILE = Path(os.environ.get("SERVICE_ACCOUNT_FILE", Path(__file__).parent / "serviceAccountKey.json"))
 
@@ -895,6 +898,9 @@ def _send_clearance_notifications(cities: list[str], centroids: dict = {}):
     }
 
     def _send():
+        if not _push_semaphore.acquire(blocking=False):
+            log.warning("📱 Clearance Push skipped: another push batch is already running")
+            return
         try:
             subs_ref = db.reference(FIREBASE_PUSH_SUBS_NODE)
             subs_data = subs_ref.get()
@@ -902,6 +908,7 @@ def _send_clearance_notifications(cities: list[str], centroids: dict = {}):
                 return
 
             sent_count = 0
+            expired_keys = []
             for sub_key, sub_info in subs_data.items():
                 if not isinstance(sub_info, dict) or "endpoint" not in sub_info:
                     continue
@@ -967,14 +974,26 @@ def _send_clearance_notifications(cities: list[str], centroids: dict = {}):
                         data=json.dumps(payload_user),
                         vapid_private_key=VAPID_PRIVATE_KEY,
                         vapid_claims={"sub": VAPID_SUBJECT},
+                        timeout=10,
                     )
                     sent_count += 1
-                except WebPushException:
-                    pass
+                except WebPushException as e:
+                    if e.response and e.response.status_code in (404, 410):
+                        expired_keys.append(sub_key)
+                except requests.exceptions.RequestException as e:
+                    log.warning("📱 Clearance push network error for %s: %s", sub_key, e)
+                    expired_keys.append(sub_key)
 
-            log.info("📱 Clearance Push complete: %d sent", sent_count)
+            for k in set(expired_keys):
+                try:
+                    db.reference(f"{FIREBASE_PUSH_SUBS_NODE}/{k}").delete()
+                except Exception:
+                    pass
+            log.info("📱 Clearance Push complete: %d sent, %d expired cleaned", sent_count, len(expired_keys))
         except Exception as e:
             log.error("📱 Clearance Push error: %s", e)
+        finally:
+            _push_semaphore.release()
 
     threading.Thread(target=_send, daemon=True).start()
 
@@ -1030,6 +1049,9 @@ def _send_push_notifications(state: dict, new_cities: list[str], centroids: dict
         })
 
     def _send():
+        if not _push_semaphore.acquire(blocking=False):
+            log.warning("📱 Push skipped: another push batch is already running")
+            return
         try:
             subs_ref = db.reference(FIREBASE_PUSH_SUBS_NODE)
             subs_data = subs_ref.get()
@@ -1124,12 +1146,17 @@ def _send_push_notifications(state: dict, new_cities: list[str], centroids: dict
                             data=json.dumps(payload),
                             vapid_private_key=VAPID_PRIVATE_KEY,
                             vapid_claims={"sub": VAPID_SUBJECT},
+                            timeout=10,
                         )
                         sent_count += 1
                     except WebPushException as e:
                         if e.response and e.response.status_code in (404, 410):
                             expired_keys.append(sub_key)
                             break
+                    except requests.exceptions.RequestException as e:
+                        log.warning("📱 Push network error for %s: %s", sub_key, e)
+                        expired_keys.append(sub_key)
+                        break
 
             # Clean up expired
             for k in set(expired_keys):
@@ -1140,6 +1167,8 @@ def _send_push_notifications(state: dict, new_cities: list[str], centroids: dict
             log.info("📱 Push complete: %d sent", sent_count)
         except Exception as e:
             log.error("📱 Push error: %s", e, exc_info=True)
+        finally:
+            _push_semaphore.release()
 
     threading.Thread(target=_send, daemon=True).start()
 
