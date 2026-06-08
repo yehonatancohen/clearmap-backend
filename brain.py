@@ -567,7 +567,11 @@ def _classify_alert_object(alert_obj: dict) -> str:
     if cat in ("1", "6"):
         return "alert"
 
-    if "בדקות הקרובות" in title or "שהייה בסמיכות" in title or "לשפר את המיקום" in title:
+    if "בדקות הקרובות" in title or "שהייה בסמיכות" in title or "לשפר את המיקום" in title or "התקרבו למרחב" in title:
+        return "pre_alert"
+
+    # Category 14 = "התקרבו למרחב מוגן" advisory
+    if cat == "14":
         return "pre_alert"
 
     # Default: treat unknown cat values as alert to be safe
