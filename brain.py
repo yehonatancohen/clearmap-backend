@@ -549,7 +549,8 @@ def _classify_alert_object(alert_obj: dict) -> str:
     - cat "10" + "בדקות הקרובות צפויות להתקבל התרעות"   → "pre_alert"
     - cat "10" + clearance signals                       → "clear"
     """
-    cat = str(alert_obj.get("cat", ""))
+    # Support both old API format (cat: str) and new format (category: int)
+    cat = str(alert_obj.get("cat", alert_obj.get("category", "")))
     title = alert_obj.get("title", "")
 
     # Clearance signals → remove from map (check before other checks since
@@ -636,10 +637,12 @@ def fetch_oref() -> list[tuple[str, str]]:
         if not isinstance(alert_obj, dict):
             continue
         status = _classify_alert_object(alert_obj)
-        cities = alert_obj.get("data", [])
-        
+        raw_data = alert_obj.get("data", [])
+        # New API returns data as a single city string; old API returns a list
+        cities = [raw_data] if isinstance(raw_data, str) else raw_data
+
         log.debug("Oref object: cat=%s title='%s' status=%s cities=%d",
-                   alert_obj.get("cat"), alert_obj.get("title", "")[:40], status, len(cities))
+                   alert_obj.get("cat", alert_obj.get("category")), alert_obj.get("title", "")[:40], status, len(cities))
 
         for city in cities:
             if not isinstance(city, str):
