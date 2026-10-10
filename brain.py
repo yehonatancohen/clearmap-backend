@@ -545,6 +545,7 @@ def _classify_alert_object(alert_obj: dict) -> str:
     Based on real API samples:
     - cat "1"  + "ירי רקטות וטילים"                     → "alert"
     - cat "6"  + "חדירת כלי טיס עוין"                   → "uav"
+    - category 2 + "כלי טייס עוין - היכנסו מייד למרחב המוגן" → "uav" (Oct 2026 wording)
     - cat "1"  + "חדירת מחבלים"                          → "terrorist"
     - cat "10" + "בדקות הקרובות צפויות להתקבל התרעות"   → "pre_alert"
     - cat "10" + clearance signals                       → "clear"
@@ -558,17 +559,25 @@ def _classify_alert_object(alert_obj: dict) -> str:
     if "ניתן לצאת" in title or "להישאר בקרבת" in title or "הסתיים" in title or "החשש הוסר" in title:
         return "clear"
 
-    # Title-based detection (works regardless of cat value)
-    if "חדירת כלי טיס עוין" in title:
-        return "uav"
-    if "חדירת מחבלים" in title:
-        return "terrorist"
-
-    if cat in ("1", "6"):
-        return "alert"
-
+    # Advisory phrasing wins over threat keywords, so an early warning that
+    # mentions the threat type isn't shown as a live alert.
     if "בדקות הקרובות" in title or "שהייה בסמיכות" in title or "לשפר את המיקום" in title or "התקרבו למרחב" in title:
         return "pre_alert"
+
+    # Title-based detection (works regardless of cat value).
+    # Oref spells it both "כלי טיס" and "כלי טייס", with or without "חדירת".
+    if "כלי טיס" in title or "כלי טייס" in title:
+        return "uav"
+    if "מחבלים" in title:
+        return "terrorist"
+
+    # Category fallback for UAV when the title wording is unrecognised:
+    # "cat" carries the matrix id (6), "category" carries the history id (2).
+    if cat == "6" or ("cat" not in alert_obj and cat == "2"):
+        return "uav"
+
+    if cat == "1":
+        return "alert"
 
     # Category 14 = "התקרבו למרחב מוגן" advisory
     if cat == "14":
