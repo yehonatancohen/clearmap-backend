@@ -14,15 +14,20 @@ Timings:
   after_alert:     persists until Oref clearance ("הסתיים"/"ניתן לצאת")
 """
 
+import inspect
 import json
 import logging
 import math
 import os
+import queue
+import random
 import re
+import socket
 import sys
 import sqlite3
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import firebase_admin
@@ -32,8 +37,12 @@ from firebase_admin import credentials, db
 try:
     from pywebpush import webpush, WebPushException
     HAS_WEBPUSH = True
+    # Newer pywebpush accepts a requests session, which lets each worker reuse
+    # its TLS connection to the push service instead of handshaking per message.
+    _WEBPUSH_HAS_SESSION = "requests_session" in inspect.signature(webpush).parameters
 except ImportError:
     HAS_WEBPUSH = False
+    _WEBPUSH_HAS_SESSION = False
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -88,8 +97,41 @@ VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "") or _cfg_env.get("VAPID
 VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "") or _cfg_env.get("VAPID_SUBJECT", "mailto:yoncohenyon@gmail.com")
 FIREBASE_PUSH_SUBS_NODE = "/push_subscriptions"
 
-# Limit concurrent push threads so a barrage doesn't pile up hundreds of stalled threads
-_push_semaphore = threading.Semaphore(2)
+
+def _env(key: str, default: str = "") -> str:
+    return os.environ.get(key, "") or _cfg_env.get(key, default)
+
+
+# ── Scale / resilience config ───────────────────────────────────────────────
+
+# Extra RTDB instances (same project) that mirror /public_state. Each instance
+# holds ~200k concurrent clients, so N mirrors ≈ N×200k viewers. The frontend
+# picks one at random from NEXT_PUBLIC_FIREBASE_DATABASE_URLS.
+FIREBASE_MIRROR_URLS = [u.strip() for u in _env("FIREBASE_MIRROR_URLS").split(",") if u.strip()]
+
+# Tried in order when the primary alert source fails (e.g. a second Israeli bridge).
+OREF_URL_FALLBACKS = [u.strip() for u in _env("OREF_URL_FALLBACKS").split(",") if u.strip()]
+
+FIREBASE_HEARTBEAT_NODE = "/public_state/heartbeat"
+FIREBASE_CLEARS_NODE = "/public_state/clears"
+FIREBASE_HISTORY_NODE = "/public_state/history"
+FIREBASE_LEADER_NODE = "/system/leader"
+
+HEARTBEAT_INTERVAL = 5          # seconds between heartbeat writes
+OREF_STALE_SECONDS = 15         # heartbeat reports oref_ok=False after this long without a good fetch
+CLEARS_TTL = 1800               # keep official "event ended" records for 30 min
+HISTORY_MAX_EVENTS = 500
+
+# Leader election lets a standby brain run alongside the primary: both poll,
+# only the lease holder writes to Firebase and sends pushes.
+LEADER_ELECTION = _env("LEADER_ELECTION", "1") != "0"
+LEADER_LEASE_TTL = 12           # seconds; a standby takes over after this much silence
+LEADER_RENEW_INTERVAL = 3
+INSTANCE_ID = f"{socket.gethostname()}-{os.getpid()}-{random.randrange(16**4):04x}"
+
+PUSH_WORKERS = int(_env("PUSH_WORKERS", "48"))
+PUSH_ALERT_MAX_AGE = 120        # drop undelivered alert pushes older than this (seconds)
+PUSH_CLEAR_MAX_AGE = 900
 
 POLYGONS_FILE = Path(os.environ.get("POLYGONS_FILE", Path(__file__).parent / "polygons.json"))
 SERVICE_ACCOUNT_FILE = Path(os.environ.get("SERVICE_ACCOUNT_FILE", Path(__file__).parent / "serviceAccountKey.json"))
@@ -532,7 +574,9 @@ def init_firebase():
         log.error(msg)
         raise RuntimeError(msg)
         
-    firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+    # Bounded HTTP timeout: the default (120s) could freeze the polling loop.
+    # Streaming listeners don't use it.
+    firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL, "httpTimeout": 10})
     log.info("Firebase initialized → %s", FIREBASE_DB_URL)
 
 
@@ -602,7 +646,23 @@ def fetch_oref() -> list[tuple[str, str]]:
     
     Returns a list of (city_name_he, status) tuples with priority merging.
     """
-    url = os.environ.get("OREF_URL_OVERRIDE", OREF_URL)
+    urls = [os.environ.get("OREF_URL_OVERRIDE", OREF_URL), *OREF_URL_FALLBACKS]
+    last_error: Exception | None = None
+    for i, url in enumerate(urls):
+        try:
+            data = _fetch_oref_json(url)
+            break
+        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+            last_error = e
+            if i < len(urls) - 1:
+                log.warning("Alert source %s failed (%s) — trying fallback", url, e)
+    else:
+        raise last_error  # type: ignore[misc]
+
+    return _parse_oref_payload(data)
+
+
+def _fetch_oref_json(url: str):
     proxy_url = os.environ.get("OREF_PROXY_URL")
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
 
@@ -623,11 +683,15 @@ def fetch_oref() -> list[tuple[str, str]]:
             log.error("HTTP 403 Forbidden from Oref (or bridge proxy). Set OREF_PROXY_URL to an Israeli proxy if hitting Oref directly.")
         raise e
 
-    try:
-        data = resp.json()
-    except json.JSONDecodeError:
-        log.warning("Oref (or proxy) returned non-JSON")
+    # Oref returns an empty body (sometimes just a BOM) when there are no alerts
+    text = resp.content.decode("utf-8-sig", errors="replace").strip()
+    if not text:
         return []
+    return json.loads(text)
+
+
+def _parse_oref_payload(data) -> list[tuple[str, str]]:
+    """Normalise an Oref (or bridge) response into (city_name_he, status) tuples."""
 
     if not data:
         return []
@@ -670,42 +734,27 @@ def fetch_oref() -> list[tuple[str, str]]:
 # ── State Machine ───────────────────────────────────────────────────────────
 
 
-def log_history_event(status, cities):
-    """Log an event to the /public_state/history node for the frontend's history panel."""
-    if not cities:
-        return
-    try:
-        ref = db.reference("/public_state/history")
-        # Push new event
-        ref.push({
-            "status": status,
-            "cities": list(cities),
-            "timestamp": {".sv": "timestamp"}
-        })
-        # Keep only last 500 events
-        def _cleanup():
-            try:
-                # This is slightly inefficient but keeps the node clean
-                snapshot = ref.order_by_key().limit_to_first(100).get()
-                if snapshot and len(ref.get() or {}) > 500:
-                    for key in snapshot.keys():
-                        ref.child(key).delete()
-            except:
-                pass
-        # Run cleanup occasionally in background
-        if time.time() % 60 < 1: # roughly once a minute
-            threading.Thread(target=_cleanup, daemon=True).start()
-            
-    except Exception as e:
-        log.error("Failed to log history: %s", e)
+class StateUpdate:
+    """What changed in one tick of the state machine. Side effects (Firebase,
+    pushes, history) are applied by the caller, and only by the leader."""
+
+    __slots__ = ("changed", "new_primary_cities", "cleared_cities", "history")
+
+    def __init__(self):
+        self.changed = False
+        self.new_primary_cities: list[str] = []
+        self.cleared_cities: list[str] = []
+        self.history: dict[str, list[str]] = {}   # status → cities, one history event each
+
+    def log(self, status: str, cities: list[str]):
+        self.history.setdefault(status, []).extend(cities)
 
 
 def update_state(
     state: dict[str, CityState],
     oref_data: list[tuple[str, str]],
     polygons: dict,
-    centroids: dict = {},
-) -> tuple[bool, list[str]]:
+) -> StateUpdate:
     """
     Updates the internal state machine.
 
@@ -715,13 +764,12 @@ def update_state(
     - after_alert:     persists until Oref "clear" signal. Re-alertable (→ alert)
 
     Priority: alert > pre_alert > after_alert
-
-    Returns: (changed_flag, list_of_newly_alerted_city_names)
     """
     now = time.time()
+    result = StateUpdate()
     changed = False
-    new_primary_cities: list[str] = []
-    
+    new_primary_cities = result.new_primary_cities
+
     # ── Step 0: Time-based auto-transitions ──────────────────────────────
     for city_he, cs in list(state.items()):
         elapsed = now - cs.started_at
@@ -768,8 +816,8 @@ def update_state(
             del incoming[city_he]
 
     if cleared_cities:
-        _send_clearance_notifications(cleared_cities, centroids)
-        log_history_event("clear", cleared_cities)
+        result.cleared_cities = cleared_cities
+        result.log("clear", cleared_cities)
 
     # ── Step 2: Process incoming signals ──────────────────────────────────
     for city_he, alert_type in incoming.items():
@@ -789,8 +837,7 @@ def update_state(
                 changed = True
                 if alert_type in ("alert", "uav", "terrorist", "pre_alert"):
                     new_primary_cities.append(city_he)
-                    # For upgrades, we log individual city events
-                    log_history_event(alert_type, [city_he])
+                    result.log(alert_type, [city_he])
             elif old_state == alert_type and alert_type in ("alert", "uav", "terrorist", "pre_alert"):
                 # Same state from Oref — refresh timer only for active oref states
                 if city_he in oref_cities:
@@ -811,16 +858,15 @@ def update_state(
             changed = True
             if alert_type in ("alert", "uav", "terrorist", "pre_alert"):
                 new_primary_cities.append(city_he)
-                # For brand new alerts, we'll log them in bulk below if multiple arrive at once
-                # but for simplicity we can just log here if it's the first time
-                log_history_event(alert_type, [city_he])
+                result.log(alert_type, [city_he])
 
     # ── Step 3: Oref signals that STOPPED ─────────────────────────────────
     # If a city was in pre_alert/alert from Oref but is no longer in Oref response,
     # let the timer handle the transition (Step 0 on next tick).
     # We do NOT force-transition here — the Oref API might just be between polls.
 
-    return changed, new_primary_cities
+    result.changed = changed
+    return result
 
 
 # ── Firebase Sync ───────────────────────────────────────────────────────────
@@ -835,27 +881,331 @@ def _sanitize_fb_key(key: str) -> str:
     return re.sub(r'[.$/\[\]#]', '_', key)
 
 
-def sync_to_firebase(state: dict[str, CityState]):
-    """Push the current state to Firebase Realtime Database."""
-    ref = db.reference(FIREBASE_NODE)
+def _live_write(path: str, value: dict, method: str = "set") -> bool:
+    """Write a /public_state node to the primary RTDB, then hand the result to
+    the mirrors. Only the primary is awaited: a slow or dead mirror must never
+    stall the polling loop."""
+    try:
+        ref = db.reference(path)
+        if method == "update":
+            ref.update(value)
+        else:
+            ref.set(value)
+        return True
+    except Exception as e:
+        log.error("Firebase write to %s failed: %s", path, e)
+        return False
 
-    if not state:
-        ref.set({})
-        log.info("Firebase synced: no active alerts.")
-        return
 
-    payload = {_sanitize_fb_key(city_he): cs.to_firebase() for city_he, cs in state.items()}
-    ref.set(payload)
-    log.info("Firebase synced: %d alerts.", len(payload))
+class MirrorTarget:
+    """Keeps one mirror RTDB instance in step with the primary on its own thread.
+
+    Holds the latest full value per path and its own baseline of what the
+    mirror has, so it ships deltas, and only this mirror re-sends in full
+    (with backoff) after a failure.
+    """
+
+    MAX_BACKOFF = 30
+
+    def __init__(self, url: str):
+        self.url = url
+        self._desired: dict[str, tuple] = {}     # path → (value, always_set)
+        self._synced: dict[str, dict | None] = {}
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        threading.Thread(target=self._run, name=f"mirror-{url[:30]}", daemon=True).start()
+
+    def reset(self):
+        """Forget the baseline (another instance may have written meanwhile)."""
+        with self._lock:
+            self._synced = {}
+        self._wake.set()
+
+    def publish(self, path: str, value: dict, always_set: bool = False):
+        with self._lock:
+            self._desired[path] = (value, always_set)
+        self._wake.set()
+
+    def _run(self):
+        backoff = 1
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            with self._lock:
+                items = list(self._desired.items())
+            failed = False
+            for path, (value, always_set) in items:
+                base = self._synced.get(path)
+                try:
+                    ref = db.reference(path, url=self.url)
+                    if base is None or always_set:
+                        ref.set(value)
+                    else:
+                        diff: dict = {k: v for k, v in value.items() if base.get(k) != v}
+                        diff.update({k: None for k in base if k not in value})
+                        if diff:
+                            ref.update(diff)
+                    self._synced[path] = None if always_set else value
+                    if always_set:
+                        with self._lock:
+                            if self._desired.get(path, (None,))[0] is value:
+                                del self._desired[path]
+                except Exception as e:
+                    failed = True
+                    self._synced[path] = None
+                    log.warning("Mirror %s write to %s failed: %s", self.url, path, e)
+            if failed:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, self.MAX_BACKOFF)
+                self._wake.set()
+            else:
+                backoff = 1
 
 
-def sync_uav_tracks(tracker: UavTracker):
-    """Push UAV flight path tracks to Firebase."""
-    uav_ref = db.reference(FIREBASE_UAV_NODE)
-    payload = tracker.to_firebase()
-    uav_ref.set(payload if payload else {})
-    if payload:
-        log.info("Firebase UAV tracks synced: %d tracks.", len(payload))
+_mirrors: list[MirrorTarget] = []
+
+
+def _publish_mirrors(path: str, value: dict, always_set: bool = False):
+    for m in _mirrors:
+        m.publish(path, value, always_set)
+
+
+class FirebaseSync:
+    """Pushes live state as deltas instead of rewriting whole nodes.
+
+    A ref.set() of active_alerts re-sends every city to every connected viewer;
+    during a 500-city salvo that is ~75KB × every viewer × every change. A
+    multi-path update only ships the cities that actually changed.
+    """
+
+    def __init__(self):
+        self._alerts: dict | None = None     # last payload every instance accepted
+        self._clears: dict[str, dict] = {}   # key → {city_name_he, ts, source}
+        self._clears_synced: dict | None = None
+        self.needs_resync = True
+
+    def reset(self):
+        """Forget what was synced; the next sync rewrites every node in full."""
+        self._alerts = None
+        self._clears_synced = None
+        self.needs_resync = True
+
+    def sync(self, state: dict[str, CityState], tracker: "UavTracker"):
+        ok = self._sync_alerts(state)
+        tracks = tracker.to_firebase() or {}
+        ok = _live_write(FIREBASE_UAV_NODE, tracks) and ok
+        _publish_mirrors(FIREBASE_UAV_NODE, tracks)
+        ok = self._sync_clears(state) and ok
+        self.needs_resync = not ok
+
+    def _sync_alerts(self, state: dict[str, CityState]) -> bool:
+        payload = {_sanitize_fb_key(city_he): cs.to_firebase() for city_he, cs in state.items()}
+        _publish_mirrors(FIREBASE_NODE, payload)
+        if self._alerts is None:
+            ok = _live_write(FIREBASE_NODE, payload)
+        else:
+            diff: dict = {k: v for k, v in payload.items() if self._alerts.get(k) != v}
+            diff.update({k: None for k in self._alerts if k not in payload})
+            if not diff:
+                return True
+            ok = _live_write(FIREBASE_NODE, diff, "update")
+        self._alerts = payload if ok else None
+        if ok:
+            log.info("Firebase synced: %d alerts.", len(payload))
+        return ok
+
+    def record_clears(self, cities: list[str]):
+        """Remember an official Oref "event ended" for each city."""
+        now_ms = int(time.time() * 1000)
+        for city_he in cities:
+            self._clears[_sanitize_fb_key(city_he)] = {
+                "city_name_he": city_he,
+                "ts": now_ms,
+                "source": "oref",
+            }
+
+    def _sync_clears(self, state: dict[str, CityState]) -> bool:
+        # A city that is alerted again (or expired long ago) no longer has a
+        # valid "you can leave" message.
+        cutoff = (time.time() - CLEARS_TTL) * 1000
+        active = {_sanitize_fb_key(c) for c in state}
+        self._clears = {k: v for k, v in self._clears.items() if v["ts"] >= cutoff and k not in active}
+        _publish_mirrors(FIREBASE_CLEARS_NODE, dict(self._clears))
+
+        if self._clears_synced is None:
+            ok = _live_write(FIREBASE_CLEARS_NODE, dict(self._clears))
+        else:
+            diff: dict = {k: v for k, v in self._clears.items() if self._clears_synced.get(k) != v}
+            diff.update({k: None for k in self._clears_synced if k not in self._clears})
+            if not diff:
+                return True
+            ok = _live_write(FIREBASE_CLEARS_NODE, diff, "update")
+        self._clears_synced = dict(self._clears) if ok else None
+        return ok
+
+    def has_expiring_clears(self) -> bool:
+        cutoff = (time.time() - CLEARS_TTL) * 1000
+        return any(v["ts"] < cutoff for v in self._clears.values())
+
+
+# ── History log ─────────────────────────────────────────────────────────────
+
+_PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+
+
+class HistoryWriter:
+    """Batches history events and writes them off the main loop.
+
+    The old code did one blocking push() per city before the map was synced,
+    so a 300-city salvo meant ~300 round-trips to Europe before anyone saw it.
+    """
+
+    FLUSH_INTERVAL = 1.0
+    CLEANUP_INTERVAL = 300
+
+    def __init__(self):
+        self._pending: list[dict] = []
+        self._lock = threading.Lock()
+        self._last_ms = 0
+        self._last_rand: list[int] = []
+
+    def start(self):
+        threading.Thread(target=self._run, name="history", daemon=True).start()
+
+    def add(self, events: dict[str, list[str]]):
+        with self._lock:
+            for status, cities in events.items():
+                if cities:
+                    self._pending.append({
+                        "status": status,
+                        "cities": list(dict.fromkeys(cities)),
+                        "timestamp": {".sv": "timestamp"},
+                    })
+
+    def _push_id(self) -> str:
+        """Chronologically sortable key, same scheme as RTDB push()."""
+        now = int(time.time() * 1000)
+        if now == self._last_ms:
+            for i in range(11, -1, -1):
+                if self._last_rand[i] != 63:
+                    self._last_rand[i] += 1
+                    break
+                self._last_rand[i] = 0
+        else:
+            self._last_ms = now
+            self._last_rand = [random.randrange(64) for _ in range(12)]
+        ts = ""
+        for _ in range(8):
+            ts = _PUSH_CHARS[now % 64] + ts
+            now //= 64
+        return ts + "".join(_PUSH_CHARS[r] for r in self._last_rand)
+
+    def _run(self):
+        last_cleanup = 0.0
+        while True:
+            time.sleep(self.FLUSH_INTERVAL)
+            with self._lock:
+                batch, self._pending = self._pending, []
+            if batch:
+                try:
+                    db.reference(FIREBASE_HISTORY_NODE).update({self._push_id(): e for e in batch})
+                except Exception as e:
+                    log.error("Failed to log history (%d events): %s", len(batch), e)
+            if time.time() - last_cleanup > self.CLEANUP_INTERVAL:
+                last_cleanup = time.time()
+                self._cleanup()
+
+    def _cleanup(self):
+        try:
+            keys = sorted((db.reference(FIREBASE_HISTORY_NODE).get(shallow=True) or {}).keys())
+            excess = keys[:-HISTORY_MAX_EVENTS] if len(keys) > HISTORY_MAX_EVENTS else []
+            if excess:
+                db.reference(FIREBASE_HISTORY_NODE).update({k: None for k in excess})
+                log.info("History cleanup: removed %d old events", len(excess))
+        except Exception as e:
+            log.warning("History cleanup failed: %s", e)
+
+
+# ── Leader election + heartbeat ─────────────────────────────────────────────
+
+
+class _LeaseHeld(Exception):
+    pass
+
+
+class LeaderElection:
+    """Lease in /system/leader so a standby brain can run next to the primary.
+
+    Every instance polls Oref and keeps its state machine warm; only the lease
+    holder writes to Firebase and sends pushes. If the leader stops renewing
+    for LEADER_LEASE_TTL seconds, a standby takes over.
+    """
+
+    def __init__(self):
+        self._valid_until = float("inf") if not LEADER_ELECTION else 0.0
+        self._was_leader = False
+
+    def start(self):
+        if LEADER_ELECTION:
+            threading.Thread(target=self._run, name="leader", daemon=True).start()
+
+    def is_leader(self) -> bool:
+        return time.time() < self._valid_until
+
+    def became_leader(self) -> bool:
+        """True exactly once each time this instance gains the lease."""
+        now_leader = self.is_leader()
+        promoted = now_leader and not self._was_leader
+        self._was_leader = now_leader
+        return promoted
+
+    def _run(self):
+        while True:
+            started = time.time()
+            now_ms = int(started * 1000)
+
+            def claim(current):
+                if (isinstance(current, dict) and current.get("id") != INSTANCE_ID
+                        and now_ms - int(current.get("ts", 0)) < LEADER_LEASE_TTL * 1000):
+                    raise _LeaseHeld()
+                return {"id": INSTANCE_ID, "ts": now_ms}
+
+            try:
+                db.reference(FIREBASE_LEADER_NODE).transaction(claim)
+                if not self.is_leader():
+                    log.info("👑 Acquired leader lease (%s)", INSTANCE_ID)
+                # Stop acting as leader a few seconds before a standby may take over
+                self._valid_until = started + LEADER_LEASE_TTL - 4
+            except _LeaseHeld:
+                if self.is_leader():
+                    log.warning("👑 Lost leader lease — switching to standby")
+                self._valid_until = 0.0
+            except Exception as e:
+                # Can't reach Firebase: keep the current lease until it runs out
+                log.warning("👑 Lease renewal failed: %s", e)
+            time.sleep(LEADER_RENEW_INTERVAL)
+
+
+class Heartbeat:
+    """Lets the frontend tell "no alerts" apart from "the poller is down"."""
+
+    def __init__(self, election: LeaderElection):
+        self._election = election
+        self.last_oref_ok = 0.0
+
+    def start(self):
+        threading.Thread(target=self._run, name="heartbeat", daemon=True).start()
+
+    def _run(self):
+        while True:
+            if self._election.is_leader():
+                beat = {
+                    "ts": {".sv": "timestamp"},
+                    "oref_ok": time.time() - self.last_oref_ok < OREF_STALE_SECONDS,
+                }
+                _live_write(FIREBASE_HEARTBEAT_NODE, beat)
+                _publish_mirrors(FIREBASE_HEARTBEAT_NODE, dict(beat), always_set=True)
+            time.sleep(HEARTBEAT_INTERVAL)
 
 
 # ── Web Push Notifications ──────────────────────────────────────────────────
@@ -875,6 +1225,16 @@ def _normalize_coords(raw) -> list | None:
             return None
     return None
 
+
+def _as_list(raw) -> list:
+    """Firebase returns arrays as lists, or as {"0": ..} dicts when sparse."""
+    if isinstance(raw, list):
+        return [v for v in raw if v is not None]
+    if isinstance(raw, dict):
+        return list(raw.values())
+    return []
+
+
 _STATUS_LABELS = {
     "alert": "צבע אדום!",
     "uav": "חדירת כלי טיס עוין",
@@ -884,309 +1244,283 @@ _STATUS_LABELS = {
 }
 
 
-def _send_clearance_notifications(cities: list[str], centroids: dict = {}):
-    """Send web push notifications when alerts are cleared."""
-    if not HAS_WEBPUSH or not VAPID_PRIVATE_KEY or not cities:
-        return
-
-    log.info("📱 Push (Clearance): preparing for %d cities", len(cities))
-
-    # Group by region
+def _region_body(cities: list[str]) -> str:
+    """"Region: City1, City2 +3 · Region2: ..." for a notification body."""
     by_region: dict[str, list[str]] = {}
     for c in cities:
-        region = CITY_REGIONS.get(c, "אחר")
-        by_region.setdefault(region, []).append(c)
-
-    region_parts = []
+        by_region.setdefault(CITY_REGIONS.get(c, "אחר"), []).append(c)
+    parts = []
     for region, r_cities in by_region.items():
         cities_str = ", ".join(r_cities[:8])
         if len(r_cities) > 8:
             cities_str += f" +{len(r_cities)-8}"
-        region_parts.append(f"{region}: {cities_str}")
-    
-    body = " · ".join(region_parts)
+        parts.append(f"{region}: {cities_str}")
+    return " · ".join(parts)
 
-    payload = {
-        "title": "האירוע הסתיים",
-        "body": f"ניתן לצאת מהמרחב המוגן:\n{body}",
-        "tag": f"clearance_{int(time.time())}",
-        "url": "https://clearmap.co.il",
-    }
 
-    def _send():
-        if not _push_semaphore.acquire(blocking=False):
-            log.warning("📱 Clearance Push skipped: another push batch is already running")
+def _match_subscriber(sub_info: dict, cities: list[str], city_set: set[str], centroids: dict) -> tuple[list[str], list[str]]:
+    """Which of `cities` this subscriber wants, and the names of their people hit.
+
+    Returns (matched_cities, people_names). People ("my people") always match,
+    even when the subscriber filters by city or location. Runs once per
+    subscriber per job, so the common all-Israel case avoids per-city work.
+    """
+    settings = sub_info.get("settings") or {}
+    all_israel = settings.get("allIsrael", True)
+
+    people_by_city: dict[str, list[str]] = {}
+    for p in _as_list(settings.get("people")):
+        if isinstance(p, dict) and p.get("city") in city_set and p.get("name"):
+            people_by_city.setdefault(p["city"], []).append(str(p["name"])[:24])
+    people_hit: list[str] = []
+    for names in people_by_city.values():
+        people_hit.extend(n for n in names if n not in people_hit)
+
+    if all_israel:
+        return cities, people_hit
+
+    selected = set(_as_list(settings.get("selectedCities"))) & city_set
+    user_coords = _normalize_coords(sub_info.get("userCoords"))
+    if not selected and not people_by_city and not user_coords:
+        return [], []
+
+    matched: list[str] = []
+    for city_he in cities:
+        if city_he in selected or city_he in people_by_city:
+            matched.append(city_he)
+        elif user_coords:
+            city_pos = centroids.get(city_he)
+            if city_pos and _haversine_km(user_coords[0], user_coords[1], city_pos[0], city_pos[1]) <= 15.0:
+                matched.append(city_he)
+    return matched, people_hit
+
+
+def _with_people(title: str, people: list[str]) -> str:
+    if not people:
+        return title
+    shown = ", ".join(people[:3]) + (f" +{len(people)-3}" if len(people) > 3 else "")
+    return f"{title} · {shown}"
+
+
+class PushDispatcher:
+    """Fans Web Push notifications out to every subscriber in parallel.
+
+    - Subscriptions are mirrored in memory via a Firebase stream instead of
+      downloading the whole node for every alert.
+    - Work is never dropped because a previous batch is still sending (the old
+      semaphore silently skipped whole salvos and clearance messages).
+    - Newest alerts go first; undelivered pushes past their max age are skipped.
+    """
+
+    RELISTEN_INTERVAL = 1800
+
+    def __init__(self):
+        self._subs: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        self._work: queue.PriorityQueue = queue.PriorityQueue()
+        self._jobs: queue.Queue = queue.Queue()
+        self._seq = 0
+        self._local = threading.local()
+
+    @property
+    def enabled(self) -> bool:
+        return HAS_WEBPUSH and bool(VAPID_PRIVATE_KEY)
+
+    def start(self):
+        if not self.enabled:
             return
-        try:
-            subs_ref = db.reference(FIREBASE_PUSH_SUBS_NODE)
-            subs_data = subs_ref.get()
-            if not subs_data:
-                return
+        threading.Thread(target=self._subs_loop, name="push-subs", daemon=True).start()
+        threading.Thread(target=self._planner, name="push-plan", daemon=True).start()
+        for i in range(PUSH_WORKERS):
+            threading.Thread(target=self._worker, name=f"push-{i}", daemon=True).start()
 
-            sent_count = 0
-            expired_keys = []
-            for sub_key, sub_info in subs_data.items():
-                if not isinstance(sub_info, dict) or "endpoint" not in sub_info:
-                    continue
+    # ── subscription mirror ──
 
-                settings = sub_info.get("settings", {})
-                if not settings.get("enabled", True) or not settings.get("leaveShelterAlerts", True):
-                    continue
+    def _subs_loop(self):
+        while True:
+            registration = None
+            try:
+                registration = db.reference(FIREBASE_PUSH_SUBS_NODE).listen(self._on_event)
+            except Exception as e:
+                log.error("📱 Push subscription stream failed: %s", e)
+                time.sleep(30)
+                continue
+            # Re-open periodically in case the stream died silently
+            time.sleep(self.RELISTEN_INTERVAL)
+            try:
+                registration.close()
+            except Exception:
+                pass
 
-                all_israel = settings.get("allIsrael", True)
-                selected_cities = set(settings.get("selectedCities", []))
-                user_coords = _normalize_coords(sub_info.get("userCoords"))
-
-                # Filter cities for this user
-                matched_cities = []
-                if all_israel:
-                    matched_cities = cities
+    def _on_event(self, event):
+        path = [p for p in (event.path or "/").split("/") if p]
+        data = event.data
+        is_patch = event.event_type == "patch"
+        with self._lock:
+            if not path:
+                if is_patch:
+                    for k, v in (data or {}).items():
+                        self._set(self._subs, [k], v)
                 else:
-                    for city_he in cities:
-                        if city_he in selected_cities:
-                            matched_cities.append(city_he)
-                            continue
-                        if user_coords and len(user_coords) == 2:
-                            city_pos = centroids.get(city_he)
-                            if city_pos:
-                                dist = _haversine_km(user_coords[0], user_coords[1], city_pos[0], city_pos[1])
-                                if dist <= 15.0:
-                                    matched_cities.append(city_he)
-                                    continue
-                
-                if not matched_cities:
+                    self._subs = dict(data) if isinstance(data, dict) else {}
+                    log.info("📱 Push subscriptions loaded: %d", len(self._subs))
+            elif is_patch:
+                for k, v in (data or {}).items():
+                    self._set(self._subs, path + [k], v)
+            else:
+                self._set(self._subs, path, data)
+
+    @staticmethod
+    def _set(root: dict, path: list[str], value):
+        node = root
+        for key in path[:-1]:
+            child = node.get(key)
+            if not isinstance(child, dict):
+                if value is None:
+                    return
+                child = node[key] = {}
+            node = child
+        if value is None:
+            node.pop(path[-1], None)
+        else:
+            node[path[-1]] = value
+
+    # ── job submission ──
+
+    def notify_alerts(self, state: dict[str, CityState], new_cities: list[str], centroids: dict):
+        if not self.enabled:
+            return
+        by_status: dict[str, list[str]] = {}
+        for city_he in new_cities:
+            cs = state.get(city_he)
+            if cs:
+                by_status.setdefault(cs.state, []).append(city_he)
+        if not by_status:
+            return
+        log.info("📱 Push: queueing %d cities: %s", len(new_cities), ", ".join(new_cities[:5]))
+        stamp = int(time.time())
+        city_sets = {status: set(cities) for status, cities in by_status.items()}
+
+        def build(sub_info: dict) -> list[dict]:
+            settings = sub_info.get("settings") or {}
+            payloads = []
+            for status, cities in by_status.items():
+                if status == "pre_alert" and not settings.get("earlyAlerts", True):
                     continue
-
-                # Group matched for this user
-                by_region_user: dict[str, list[str]] = {}
-                for c in matched_cities:
-                    region = CITY_REGIONS.get(c, "אחר")
-                    by_region_user.setdefault(region, []).append(c)
-
-                region_parts = []
-                for region, r_cities in by_region_user.items():
-                    cities_str = ", ".join(r_cities[:8])
-                    if len(r_cities) > 8:
-                        cities_str += f" +{len(r_cities)-8}"
-                    region_parts.append(f"{region}: {cities_str}")
-                
-                body_user = " · ".join(region_parts)
-
-                subscription_info = {
-                    "endpoint": sub_info["endpoint"],
-                    "keys": sub_info.get("keys", {}),
-                }
-
-                payload_user = {
-                    "title": "האירוע הסתיים",
-                    "body": f"ניתן לצאת מהמרחב המוגן:\n{body_user}",
-                    "tag": f"clearance_{int(time.time())}",
+                matched, people = _match_subscriber(sub_info, cities, city_sets[status], centroids)
+                if not matched:
+                    continue
+                payloads.append({
+                    "title": _with_people(_STATUS_LABELS.get(status, "התרעה"), people),
+                    "body": _region_body(matched),
+                    "tag": f"push_{status}_{stamp}",
                     "url": "https://clearmap.co.il",
-                }
+                })
+            return payloads
 
+        self._enqueue(build, ttl=300, max_age=PUSH_ALERT_MAX_AGE, label="alert")
+
+    def notify_clearance(self, cities: list[str], centroids: dict):
+        if not self.enabled or not cities:
+            return
+        log.info("📱 Push (Clearance): queueing %d cities", len(cities))
+        stamp = int(time.time())
+        city_set = set(cities)
+
+        def build(sub_info: dict) -> list[dict]:
+            settings = sub_info.get("settings") or {}
+            if not settings.get("leaveShelterAlerts", True):
+                return []
+            matched, people = _match_subscriber(sub_info, cities, city_set, centroids)
+            if not matched:
+                return []
+            return [{
+                "title": _with_people("האירוע הסתיים", people),
+                "body": f"ניתן לצאת מהמרחב המוגן:\n{_region_body(matched)}",
+                "tag": f"clearance_{stamp}",
+                "url": "https://clearmap.co.il",
+            }]
+
+        self._enqueue(build, ttl=1800, max_age=PUSH_CLEAR_MAX_AGE, label="clearance")
+
+    def _enqueue(self, build, ttl: int, max_age: int, label: str):
+        # Matching every subscriber is too slow for the polling loop; a planner
+        # thread does it and feeds the delivery workers.
+        self._jobs.put((build, ttl, max_age, label, time.time()))
+
+    def _planner(self):
+        while True:
+            build, ttl, max_age, label, created = self._jobs.get()
+            try:
+                self._plan(build, ttl, created + max_age, label)
+            except Exception as e:
+                log.error("📱 Push planning failed (%s): %s", label, e, exc_info=True)
+
+    def _plan(self, build, ttl: int, deadline: float, label: str):
+        with self._lock:
+            subs = list(self._subs.items())
+            self._seq += 1
+            seq = self._seq
+        queued = 0
+        for sub_key, sub_info in subs:
+            if not isinstance(sub_info, dict) or "endpoint" not in sub_info:
+                continue
+            if not (sub_info.get("settings") or {}).get("enabled", True):
+                continue
+            payloads = build(sub_info)
+            if not payloads:
+                continue
+            # Newest job first (-seq); ties broken by insertion order
+            self._work.put((-seq, queued, (sub_key, sub_info, payloads, ttl, deadline)))
+            queued += 1
+        log.info("📱 Push %s job #%d: %d subscribers queued (%d total)", label, seq, queued, len(subs))
+
+    # ── delivery ──
+
+    def _session(self) -> requests.Session:
+        s = getattr(self._local, "session", None)
+        if s is None:
+            s = self._local.session = requests.Session()
+        return s
+
+    def _worker(self):
+        while True:
+            _, _, (sub_key, sub_info, payloads, ttl, deadline) = self._work.get()
+            if time.time() > deadline:
+                continue
+            subscription_info = {"endpoint": sub_info["endpoint"], "keys": sub_info.get("keys", {})}
+            extra = {"requests_session": self._session()} if _WEBPUSH_HAS_SESSION else {}
+            for payload in payloads:
                 try:
                     webpush(
                         subscription_info=subscription_info,
-                        data=json.dumps(payload_user),
+                        data=json.dumps(payload),
                         vapid_private_key=VAPID_PRIVATE_KEY,
                         vapid_claims={"sub": VAPID_SUBJECT},
                         timeout=10,
+                        ttl=ttl,
+                        headers={"Urgency": "high"},
+                        **extra,
                     )
-                    sent_count += 1
                 except WebPushException as e:
-                    if e.response and e.response.status_code in (404, 410):
-                        expired_keys.append(sub_key)
-                except requests.exceptions.RequestException as e:
-                    log.warning("📱 Clearance push network error for %s: %s", sub_key, e)
-                    expired_keys.append(sub_key)
-
-            for k in set(expired_keys):
-                try:
-                    db.reference(f"{FIREBASE_PUSH_SUBS_NODE}/{k}").delete()
-                except Exception:
-                    pass
-            log.info("📱 Clearance Push complete: %d sent, %d expired cleaned", sent_count, len(expired_keys))
-        except Exception as e:
-            log.error("📱 Clearance Push error: %s", e)
-        finally:
-            _push_semaphore.release()
-
-    threading.Thread(target=_send, daemon=True).start()
-
-
-def _send_push_notifications(state: dict, new_cities: list[str], centroids: dict = {}):
-    """Send web push notifications for new alerts in a background thread."""
-    if not HAS_WEBPUSH:
-        log.warning("📱 Push skipped: pywebpush not installed")
-        return
-    if not VAPID_PRIVATE_KEY:
-        log.warning("📱 Push skipped: VAPID_PRIVATE_KEY not set")
-        return
-
-    log.info("📱 Push: preparing for %d cities: %s", len(new_cities), ", ".join(new_cities[:5]))
-
-    # Build notification payload grouped by status
-    by_status: dict[str, list[str]] = {}
-    for city_he in new_cities:
-        cs = state.get(city_he)
-        if not cs:
-            continue
-        by_status.setdefault(cs.state, []).append(city_he)
-
-    if not by_status:
-        log.warning("📱 Push skipped: no matching states")
-        return
-
-    payloads = []
-    for status, cities in by_status.items():
-        title = _STATUS_LABELS.get(status, "התרעה")
-
-        # Group cities by region for all status types
-        by_region: dict[str, list[str]] = {}
-        for c in cities:
-            region = CITY_REGIONS.get(c, "אחר")
-            by_region.setdefault(region, []).append(c)
-
-        # Build body: "Region: City1, City2..."
-        region_parts = []
-        for region, r_cities in by_region.items():
-            cities_str = ", ".join(r_cities[:8])
-            if len(r_cities) > 8:
-                cities_str += f" +{len(r_cities)-8}"
-            region_parts.append(f"{region}: {cities_str}")
-        
-        body = " · ".join(region_parts)
-
-        payloads.append({
-            "title": title,
-            "body": body,
-            "tag": f"push_{status}_{int(time.time())}",
-            "url": "https://clearmap.co.il",
-        })
-
-    def _send():
-        if not _push_semaphore.acquire(blocking=False):
-            log.warning("📱 Push skipped: another push batch is already running")
-            return
-        try:
-            subs_ref = db.reference(FIREBASE_PUSH_SUBS_NODE)
-            subs_data = subs_ref.get()
-            if not subs_data:
-                log.warning("📱 Push: no subscriptions found")
-                return
-
-            sent_count = 0
-            expired_keys = []
-
-            for sub_key, sub_info in subs_data.items():
-                if not isinstance(sub_info, dict) or "endpoint" not in sub_info:
-                    expired_keys.append(sub_key)
-                    continue
-
-                settings = sub_info.get("settings") or {}
-
-                # Default to enabled if settings are missing (consistent with clearance behavior)
-                enabled = settings.get("enabled", True)
-                if not enabled:
-                    continue
-
-                selected_cities = set(settings.get("selectedCities", []))
-                all_israel = settings.get("allIsrael", True)
-                user_coords = _normalize_coords(sub_info.get("userCoords"))
-
-                # Filter status types (pre_alert, leave_shelter)
-                # Note: 'leave_shelter' corresponds to 'clear' in backend
-                early_alerts_enabled = settings.get("earlyAlerts", True)
-                # leave_shelter is handled in _send_clearance_notifications
-
-                subscription_info = {
-                    "endpoint": sub_info["endpoint"],
-                    "keys": sub_info.get("keys", {}),
-                }
-
-                for status, cities in by_status.items():
-                    if status == "pre_alert" and not early_alerts_enabled:
-                        continue
-
-                    # Determine which cities in this status match this user's filter
-                    matched_cities = []
-                    if all_israel:
-                        matched_cities = cities
-                    else:
-                        for city_he in cities:
-                            # 1. Direct city match
-                            if city_he in selected_cities:
-                                matched_cities.append(city_he)
-                                continue
-                            
-                            # 2. Location proximity (15km radius)
-                            if user_coords and len(user_coords) == 2:
-                                city_pos = centroids.get(city_he)
-                                if city_pos:
-                                    dist = _haversine_km(user_coords[0], user_coords[1], city_pos[0], city_pos[1])
-                                    if dist <= 15.0:
-                                        matched_cities.append(city_he)
-                                        continue
-
-                    if not matched_cities:
-                        continue
-
-                    # Construct per-user payload
-                    title = _STATUS_LABELS.get(status, "התרעה")
-                    
-                    # Group matched cities by region
-                    by_region_user: dict[str, list[str]] = {}
-                    for c in matched_cities:
-                        region = CITY_REGIONS.get(c, "אחר")
-                        by_region_user.setdefault(region, []).append(c)
-
-                    region_parts = []
-                    for region, r_cities in by_region_user.items():
-                        cities_str = ", ".join(r_cities[:8])
-                        if len(r_cities) > 8:
-                            cities_str += f" +{len(r_cities)-8}"
-                        region_parts.append(f"{region}: {cities_str}")
-                    
-                    body = " · ".join(region_parts)
-
-                    payload = {
-                        "title": title,
-                        "body": body,
-                        "tag": f"push_{status}_{int(time.time())}",
-                        "url": "https://clearmap.co.il",
-                    }
-
-                    try:
-                        webpush(
-                            subscription_info=subscription_info,
-                            data=json.dumps(payload),
-                            vapid_private_key=VAPID_PRIVATE_KEY,
-                            vapid_claims={"sub": VAPID_SUBJECT},
-                            timeout=10,
-                        )
-                        sent_count += 1
-                    except WebPushException as e:
-                        if e.response and e.response.status_code in (404, 410):
-                            expired_keys.append(sub_key)
-                            break
-                    except requests.exceptions.RequestException as e:
-                        log.warning("📱 Push network error for %s: %s", sub_key, e)
-                        expired_keys.append(sub_key)
+                    if e.response is not None and e.response.status_code in (404, 410):
+                        self._expire(sub_key)
                         break
+                    log.debug("📱 Push failed for %s: %s", sub_key, e)
+                except requests.exceptions.RequestException as e:
+                    log.warning("📱 Push network error for %s: %s", sub_key, e)
+                    break
+                except Exception as e:
+                    log.warning("📱 Push error for %s: %s", sub_key, e)
+                    break
 
-            # Clean up expired
-            for k in set(expired_keys):
-                try:
-                    db.reference(f"{FIREBASE_PUSH_SUBS_NODE}/{k}").delete()
-                except: pass
-
-            log.info("📱 Push complete: %d sent", sent_count)
-        except Exception as e:
-            log.error("📱 Push error: %s", e, exc_info=True)
-        finally:
-            _push_semaphore.release()
-
-    threading.Thread(target=_send, daemon=True).start()
+    def _expire(self, sub_key: str):
+        with self._lock:
+            self._subs.pop(sub_key, None)
+        try:
+            db.reference(f"{FIREBASE_PUSH_SUBS_NODE}/{sub_key}").delete()
+        except Exception:
+            pass
 
 
 # ── Telegram Bot ────────────────────────────────────────────────────────────
@@ -1269,8 +1603,36 @@ def _bot_poller():
 # ── Main Loop ───────────────────────────────────────────────────────────────
 
 
+def restore_state(state: dict[str, CityState], polygons: dict, fb_sync: FirebaseSync):
+    """Adopt what is currently published, so a restart or failover doesn't wipe
+    cities that are still in after_alert (Oref no longer lists those)."""
+    try:
+        published = db.reference(FIREBASE_NODE).get() or {}
+        clears = db.reference(FIREBASE_CLEARS_NODE).get() or {}
+    except Exception as e:
+        log.warning("Could not restore published state: %s", e)
+        return
+    adopted = 0
+    for entry in published.values() if isinstance(published, dict) else []:
+        if not isinstance(entry, dict) or entry.get("is_test"):
+            continue
+        city_he = entry.get("city_name_he")
+        if not city_he or city_he in state or city_he not in polygons:
+            continue
+        cs = CityState(city_he, polygons[city_he]["city_name"], float(entry.get("timestamp", 0)) / 1000 or time.time())
+        cs.state = entry.get("status", "alert")
+        cs.is_double = bool(entry.get("is_double"))
+        state[city_he] = cs
+        adopted += 1
+    for entry in clears.values() if isinstance(clears, dict) else []:
+        if isinstance(entry, dict) and entry.get("city_name_he") and entry.get("ts"):
+            fb_sync._clears.setdefault(_sanitize_fb_key(entry["city_name_he"]), entry)
+    if adopted:
+        log.info("Restored %d published alerts from Firebase", adopted)
+
+
 def main():
-    log.info("=== Clearmap Brain starting ===")
+    log.info("=== Clearmap Brain starting (%s) ===", INSTANCE_ID)
 
     polygons = load_polygons()
     if not polygons:
@@ -1283,16 +1645,25 @@ def main():
     centroids = {name: _compute_centroid(p["polygon"]) for name, p in polygons.items() if p.get("polygon")}
     uav_tracker = UavTracker()
 
-    # Don't clear Firebase on startup — preserve frontend state across restarts
-    # sync_to_firebase(state)
-    # sync_uav_tracks(uav_tracker)
+    fb_sync = FirebaseSync()
+    history = HistoryWriter()
+    election = LeaderElection()
+    heartbeat = Heartbeat(election)
+    pushes = PushDispatcher()
 
-    # Log push notification readiness
-    if HAS_WEBPUSH and VAPID_PRIVATE_KEY:
-        log.info("📱 Web Push ENABLED (VAPID key set, pywebpush installed)")
+    restore_state(state, polygons, fb_sync)
+    for component in (history, election, heartbeat, pushes):
+        component.start()
+
+    if pushes.enabled:
+        log.info("📱 Web Push ENABLED (%d workers, session reuse=%s)", PUSH_WORKERS, _WEBPUSH_HAS_SESSION)
     else:
         log.warning("📱 Web Push DISABLED — HAS_WEBPUSH=%s, VAPID_PRIVATE_KEY=%s",
                      HAS_WEBPUSH, "SET" if VAPID_PRIVATE_KEY else "EMPTY")
+    if FIREBASE_MIRROR_URLS:
+        _mirrors.extend(MirrorTarget(url) for url in FIREBASE_MIRROR_URLS)
+        log.info("Mirroring live state to %d extra RTDB instance(s)", len(FIREBASE_MIRROR_URLS))
+    log.info("Leader election: %s", "ON" if LEADER_ELECTION else "OFF (always leader)")
 
     log.info("Polling Oref every %.1fs | alert=%ds pre_alert=%ds after_alert=until_clear",
              POLL_INTERVAL, ALERT_DURATION, PRE_ALERT_TTL)
@@ -1300,23 +1671,38 @@ def main():
     while True:
         try:
             oref_data = fetch_oref()
-            changed, new_primary_cities = update_state(state, oref_data, polygons, centroids)
+            heartbeat.last_oref_ok = time.time()
+        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+            log.error("Alert source error: %s", e)
+            oref_data = []  # still run the time-based transitions below
+
+        try:
+            upd = update_state(state, oref_data, polygons)
 
             uav_cities = {c for c, cs in state.items() if cs.state == "uav"}
             tracks_changed = uav_tracker.update(uav_cities, centroids, time.time())
 
-            if changed or tracks_changed:
-                sync_to_firebase(state)
-                sync_uav_tracks(uav_tracker)
+            if election.became_leader():
+                restore_state(state, polygons, fb_sync)
+                fb_sync.reset()
+                for m in _mirrors:
+                    m.reset()
 
-            # Send push notifications only for genuinely new/upgraded cities
-            if new_primary_cities:
-                _send_push_notifications(state, new_primary_cities, centroids)
+            if election.is_leader():
+                # Map first: everything else is slower and less urgent
+                if upd.cleared_cities:
+                    fb_sync.record_clears(upd.cleared_cities)
+                if (upd.changed or tracks_changed or upd.cleared_cities
+                        or fb_sync.needs_resync or fb_sync.has_expiring_clears()):
+                    fb_sync.sync(state, uav_tracker)
 
-        except requests.exceptions.RequestException as e:
-            log.error("HTTP error: %s", e)
-        except json.JSONDecodeError as e:
-            log.error("JSON parse error: %s", e)
+                # Send push notifications only for genuinely new/upgraded cities
+                if upd.new_primary_cities:
+                    pushes.notify_alerts(state, upd.new_primary_cities, centroids)
+                if upd.cleared_cities:
+                    pushes.notify_clearance(upd.cleared_cities, centroids)
+                history.add(upd.history)
+
         except Exception as e:
             log.error("Unexpected error: %s", e, exc_info=True)
 
@@ -1325,4 +1711,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
