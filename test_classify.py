@@ -21,11 +21,16 @@ cases = [
     ({"cat": "6",     "title": "",                                          "data": ["ערב אל עראמשה"]}, "uav"),
     ({"category": 13, "title": "כלי טייס עוין - האירוע הסתיים",   "data": "ערב אל עראמשה"}, "clear"),
     ({"category": 10, "title": "בדקות הקרובות צפויות להתקבל התרעות על כלי טיס עוין", "data": "חיפה"}, "pre_alert"),
+    # Oct 2026 terror all-clear wording (was read as a second infiltration)
+    ({"category": 13, "title": "הוסר החשש לחדירת מחבלים",               "data": "אביתר"},          "clear"),
+    ({"category": 13, "title": "",                                          "data": "אביתר"},          "clear"),
+    ({"category": 14, "title": "איום מלבנון - התקרבו למרחב מוגן",       "data": "מטולה"},          "pre_alert"),
 ]
 
 # Labels for readability
 labels = ["alert", "uav", "terrorist", "pre_alert", "clear", "old-alert", "old-pre_alert",
-          "uav-new-title", "uav-category-only", "uav-cat-only", "uav-ended", "uav-advisory"]
+          "uav-new-title", "uav-category-only", "uav-cat-only", "uav-ended", "uav-advisory",
+          "terror-cleared", "clear-category-only", "pre_alert-lebanon"]
 
 all_pass = True
 for i, (obj, expected) in enumerate(cases):

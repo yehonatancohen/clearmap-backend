@@ -599,8 +599,10 @@ def _classify_alert_object(alert_obj: dict) -> str:
     title = alert_obj.get("title", "")
 
     # Clearance signals → remove from map (check before other checks since
-    # "חדירת כלי טיס עוין - האירוע הסתיים" contains both keywords)
-    if "ניתן לצאת" in title or "להישאר בקרבת" in title or "הסתיים" in title or "החשש הוסר" in title:
+    # "חדירת כלי טיס עוין - האירוע הסתיים" contains both keywords).
+    # Terror clears read "הוסר החשש לחדירת מחבלים" (Oct 2026), older ones "החשש הוסר".
+    if ("ניתן לצאת" in title or "להישאר בקרבת" in title or "הסתיים" in title
+            or "החשש הוסר" in title or "הוסר החשש" in title):
         return "clear"
 
     # Advisory phrasing wins over threat keywords, so an early warning that
@@ -626,6 +628,11 @@ def _classify_alert_object(alert_obj: dict) -> str:
     # Category 14 = "התקרבו למרחב מוגן" advisory
     if cat == "14":
         return "pre_alert"
+
+    # Unrecognised wording: "category" 13 is the history id for "event ended".
+    # Last, so a threat title never loses to it (matrix id 13 is terror).
+    if "cat" not in alert_obj and cat == "13":
+        return "clear"
 
     # Default: treat unknown cat values as alert to be safe
     return "alert"
